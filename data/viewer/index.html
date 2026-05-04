@@ -1,0 +1,1516 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<title>TAZ — Blocks · Zoning · Parcels 통합 뷰어</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate" />
+<meta http-equiv="Pragma" content="no-cache" />
+<meta http-equiv="Expires" content="0" />
+<script src="https://unpkg.com/deck.gl@9.0.33/dist.min.js"></script>
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+<script src="https://unpkg.com/flatgeobuf@3.36.0/dist/flatgeobuf-geojson.min.js"></script>
+<style>
+  html, body, #map { margin:0; padding:0; height:100%; width:100%;
+    background:#0b1020; font: 13px/1.45 -apple-system, system-ui, "Segoe UI", "Apple SD Gothic Neo", "맑은 고딕", sans-serif; color:#e8ecf3; }
+  #panel {
+    position: absolute; top: 12px; left: 12px; z-index: 10;
+    background: rgba(15, 21, 38, 0.92); padding: 12px 14px;
+    border-radius: 10px; min-width: 270px; max-width: 320px;
+    backdrop-filter: blur(6px); box-shadow: 0 6px 24px rgba(0,0,0,0.45);
+  }
+  #tabs { display:flex; gap:4px; margin-bottom: 10px; }
+  .tab {
+    flex:1; padding: 6px 8px; text-align:center; cursor:pointer; user-select:none;
+    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 6px; font-size:12px; color:#aab3c5;
+  }
+  .tab.active { background: rgba(80,160,240,0.25); border-color: #82c0ff; color:#fff; }
+  h3 { margin: 0 0 6px; font-size: 14px; font-weight: 600; }
+  .desc { font-size: 11px; color:#a8b3cc; margin-bottom: 8px; line-height: 1.4; }
+  .row { display:flex; align-items:center; gap:8px; margin: 3px 0; cursor:pointer; user-select:none; font-size: 12px; }
+  .row.off { opacity: 0.32; }
+  .sw { width: 13px; height: 11px; border-radius: 2px; flex: none; }
+  .sw.line { height: 4px; border-radius: 2px; }
+  .toggle { font-size:11px; padding:3px 7px; border:1px solid #555; border-radius:4px; background:#1a2238; color:#ccc; cursor:pointer; }
+  .toggle.on { background:#3a7; color:#000; border-color:#3a7; }
+  .stats { font-size:11px; color:#cfd6e4; border-top:1px solid rgba(255,255,255,0.1); margin-top:8px; padding-top:8px; line-height:1.6; }
+  #status { font-size:11px; color:#8995ad; margin-top:6px; min-height:14px; }
+  #legend { font-size:11px; color:#cfd6e4; margin-top:8px; max-height: 360px; overflow-y: auto; }
+  .ct { color:#7e8aa3; font-size:10.5px; margin-left:auto; }
+  #tooltip {
+    position: absolute; pointer-events: none; z-index: 20;
+    background: rgba(11,16,32,0.92); color:#fff; padding: 8px 11px;
+    font: 12px/1.5 monospace; border-radius: 6px;
+    border: 1px solid rgba(255,255,255,0.08);
+    transform: translate(8px, 8px); display: none; max-width: 360px;
+  }
+  .spinner {
+    display:inline-block; width:9px; height:9px; border:2px solid #555; border-top-color:#82c0ff;
+    border-radius:50%; animation: spin 0.7s linear infinite; vertical-align:-1px; margin-right:4px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <div id="tabs">
+    <div class="tab active" data-mode="blocks">Blocks</div>
+    <div class="tab" data-mode="road">Road</div>
+    <div class="tab" data-mode="zoning_uq">Zoning</div>
+    <div class="tab" data-mode="parcels">Parcels</div>
+    <div class="tab" data-mode="points">Points</div>
+    <div class="tab" data-mode="stats">Stats</div>
+  </div>
+  <h3 id="title">Superblock + 도로</h3>
+  <div class="desc" id="desc">간선으로 둘러싸인 1,647 superblock + 26k 간선. 블록은 주력 토지이용으로 색칠.</div>
+  <div id="layer-toggles"></div>
+  <div id="legend"></div>
+  <div class="stats" id="stats"></div>
+  <div id="status"></div>
+</div>
+<div id="tooltip"></div>
+
+<script>
+const {DeckGL, GeoJsonLayer, ScatterplotLayer, MVTLayer} = deck;
+const fgb = window.flatgeobuf;
+
+const fmt = n => n == null ? '-' : (typeof n === 'number' ? n.toLocaleString('ko-KR') : n);
+const fmtKm2 = m2 => (m2 / 1e6).toFixed(2) + ' km²';
+const tooltip = document.getElementById('tooltip');
+const statusEl = document.getElementById('status');
+const setStatus = s => statusEl.innerHTML = s;
+
+const MAP_STYLE = {
+  version: 8,
+  sources: {
+    carto: { type:'raster', tileSize:256,
+      tiles:['https://a.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}@2x.png',
+             'https://b.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}@2x.png',
+             'https://c.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}@2x.png',
+             'https://d.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}@2x.png'],
+      attribution:'© OpenStreetMap contributors © CARTO' },
+    cartoLabels: { type:'raster', tileSize:256,
+      tiles:['https://a.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}@2x.png',
+             'https://b.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}@2x.png',
+             'https://c.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}@2x.png',
+             'https://d.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}@2x.png'] },
+  },
+  layers: [
+    {id:'bg', type:'background', paint:{'background-color':'#0b1020'}},
+    {id:'carto', type:'raster', source:'carto'},
+    {id:'cartoLabels', type:'raster', source:'cartoLabels'}
+  ]
+};
+
+const ZONE_COLORS = {
+  '전용주거':            [255, 245, 200],
+  '일반주거_저밀(1종)':   [255, 217, 145],
+  '일반주거_중밀(2종)':   [255, 176, 102],
+  '일반주거_고밀(3종)':   [230, 120,  72],
+  '일반주거_기타':       [180, 180, 180],
+  '준주거':              [200,  80,  90],
+  '중심·일반상업':        [220,  40,  60],
+  '근린·유통상업':        [255, 120, 130],
+  '전용공업':            [120,  90, 170],
+  '일반·준공업':          [150, 110, 200],
+  '보전·자연녹지':        [ 80, 170, 110],
+  '생산녹지':            [180, 210, 110],
+  '관리·농림·자연환경':    [160, 200, 160],
+  '도시지역_세부미지정':  [ 90,  95, 110],
+  '미지정':              [ 70,  75,  90],
+  '_없음':               [ 60,  60,  60],
+};
+const ZONE_ORDER = [
+  '전용주거','일반주거_저밀(1종)','일반주거_중밀(2종)','일반주거_고밀(3종)','일반주거_기타',
+  '준주거','중심·일반상업','근린·유통상업',
+  '전용공업','일반·준공업',
+  '보전·자연녹지','생산녹지','관리·농림·자연환경',
+  '도시지역_세부미지정','미지정','_없음',
+];
+const zoneVisibility = {};
+ZONE_ORDER.forEach(k => zoneVisibility[k] = true);
+
+let viewState = { longitude: 126.99, latitude: 37.55, zoom: 11.5, pitch: 0, bearing: 0 };
+let activeMode = 'blocks';
+
+// --- BLOCKS mode ---
+const BlocksMode = (() => {
+  const stores = { blocks: new Map(), arterial: new Map(), aux: new Map(), oa_excl: new Map() };
+  const URLS = { blocks: 'blocks.fgb', arterial: 'arterial.fgb', aux: 'aux.fgb', oa_excl: 'oa_stats.fgb' };
+  const ID_KEY = { blocks: 'block_id', arterial: 'link_id', aux: 'link_id', oa_excl: 'oa_cd' };
+  const layerOn = { 'blocks-fill': true, 'blocks-line': true, arterial: true, aux: false, 'oa-excl': true };
+  let aggMode = 'major_lu';
+  let manifest = null;
+  const inflight = {};
+  let gen = 0;
+
+  const KIND_COLOR = { boundary: [240,100,100], edge: [240,200,80], outside: [150,150,150] };
+  const LINE_W = { boundary: 2.2, edge: 1.6, outside: 0.8 };
+
+  async function init() {
+    manifest = await (await fetch('manifest.json?v=' + Date.now())).json();
+    Object.assign(viewState, { longitude: manifest.center[0], latitude: manifest.center[1], zoom: 11.5 });
+  }
+
+  // share 변수들의 색상 ramp 종점 (start RGB → end RGB). 0~1 linear.
+  const SHARE_RAMPS = {
+    major_share:     [[ 30, 30, 60], [255, 200, 80]],
+    buildable_share: [[ 60, 30, 30], [120, 220, 120]],
+    road_share:      [[ 30, 30, 50], [240, 100, 100]],
+    rail_share:      [[ 30, 30, 30], [180, 130, 90]],
+    water_share:     [[ 20, 30, 60], [ 80, 180, 240]],
+    public_share:    [[ 40, 30, 60], [220, 180, 240]],
+  };
+  function rampColor(t, ramp) {
+    t = Math.max(0, Math.min(1, t));
+    const [a, b] = ramp;
+    return [
+      Math.round(a[0] + (b[0]-a[0]) * t),
+      Math.round(a[1] + (b[1]-a[1]) * t),
+      Math.round(a[2] + (b[2]-a[2]) * t),
+      210
+    ];
+  }
+  function aggColor(props) {
+    if (aggMode === 'major_lu') {
+      const k = props.major_lu;
+      if (!zoneVisibility[k]) return [0, 0, 0, 0];
+      const c = ZONE_COLORS[k] || [120,120,120];
+      return [c[0], c[1], c[2], 230];
+    }
+    if (aggMode === 'none') return [255, 255, 255, 25];
+    if (aggMode === 'area') {
+      const v = props.area_m2 || 0;
+      const t = Math.min(1, Math.log1p(v) / Math.log1p(1_000_000));
+      return [Math.round(70+(250-70)*t), Math.round(20+(220-20)*t), Math.round(110+(50-110)*t), 200];
+    }
+    if (SHARE_RAMPS[aggMode]) {
+      const v = props[aggMode] || 0;
+      return rampColor(v, SHARE_RAMPS[aggMode]);
+    }
+    return [255, 255, 255, 25];
+  }
+
+  // 도로 등급별 색·굵기 (centerline scls 기반: A0021 고속 / A0022 국도 / A00231 시도 / 그외)
+  function arterialColor(scls) {
+    if (scls === 'A0021') return [255,  60,  60, 235];   // 고속 — 진한 빨강
+    if (scls === 'A0022') return [255, 140,  60, 230];   // 국도 — 주황
+    if (scls && scls.startsWith('A00231')) return [255, 200,  80, 220]; // 시도 — 호박
+    return [240, 100, 100, 220];                          // 그 외 (특별시도 등) — 연한 빨강
+  }
+  function arterialWidth(scls) {
+    if (scls === 'A0021') return 3.2;
+    if (scls === 'A0022') return 2.4;
+    if (scls && scls.startsWith('A00231')) return 2.0;
+    return 1.6;
+  }
+
+  function buildLayers() {
+    const layers = [];
+    // (0) 산/강 OA — 분석 제외 영역, 가장 아래
+    if (layerOn['oa-excl']) {
+      const excl = Array.from(stores.oa_excl.values()).filter(f => f.properties.kind !== '도시');
+      layers.push(new GeoJsonLayer({
+        id: 'oa-excl', data: excl,
+        stroked: true, filled: true,
+        getFillColor: f => f.properties.kind === '수계' ? [40, 80, 130, 130] : [60, 90, 60, 130],
+        getLineColor: [255,255,255,30],
+        lineWidthUnits:'pixels', getLineWidth: 0.3, lineWidthMinPixels: 0.3,
+        pickable: false,
+      }));
+    }
+    const blockArr = Array.from(stores.blocks.values());
+    if (layerOn['blocks-fill']) {
+      layers.push(new GeoJsonLayer({
+        id: 'blocks-fill', data: blockArr,
+        stroked: false, filled: true, opacity: 1,
+        getFillColor: f => aggColor(f.properties),
+        pickable: true,
+        updateTriggers: { getFillColor: [aggMode, JSON.stringify(zoneVisibility)] },
+      }));
+    }
+    // 도로 → 블록 경계보다 아래
+    for (const kind of ['aux', 'arterial']) {
+      if (!layerOn[kind]) continue;
+      const arr = Array.from(stores[kind].values());
+      layers.push(new GeoJsonLayer({
+        id: 'road-' + kind, data: arr,
+        stroked: true, filled: false,
+        getLineColor: f => kind === 'arterial' ? arterialColor(f.properties.scls)
+                                                : (KIND_COLOR[f.properties.kind] || KIND_COLOR.outside),
+        lineWidthUnits:'pixels',
+        getLineWidth: f => kind === 'arterial' ? arterialWidth(f.properties.scls)
+                                                : (LINE_W[f.properties.kind] || 1),
+        lineWidthMinPixels: 0.6,
+        pickable: kind === 'arterial',
+      }));
+    }
+    // 블록 경계 — 맨 위 (도로 위에 흰색 frame 으로 분명하게)
+    if (layerOn['blocks-line']) {
+      const z = viewState.zoom;
+      const w = z >= 14 ? 2.2 : z >= 12 ? 1.6 : 1.2;
+      layers.push(new GeoJsonLayer({
+        id: 'blocks-line', data: blockArr,
+        stroked: true, filled: false,
+        getLineColor: [255,255,255,210],
+        lineWidthUnits:'pixels', getLineWidth: w, lineWidthMinPixels: 1.0,
+        updateTriggers: { getLineWidth: w },
+      }));
+    }
+    return layers;
+  }
+
+  async function loadKind(kind, rect, mygen) {
+    if (inflight[kind]) inflight[kind].cancelled = true;
+    const tok = { cancelled: false };
+    inflight[kind] = tok;
+    let added = 0;
+    try {
+      for await (const f of fgb.deserialize(URLS[kind], rect)) {
+        if (tok.cancelled || mygen !== gen || activeMode !== 'blocks') return;
+        const id = f.properties[ID_KEY[kind]];
+        if (id == null) continue;
+        if (!stores[kind].has(id)) {
+          stores[kind].set(id, f);
+          added++;
+          if (added % 4000 === 0) requestRender();
+        }
+      }
+    } catch(e) { console.warn('[blocks]', kind, e); }
+    if (!tok.cancelled) requestRender();
+  }
+
+  function reload() {
+    const mygen = ++gen;
+    const rect = currentBbox();
+    const z = viewState.zoom;
+    const tasks = [];
+    tasks.push(loadKind('blocks', rect, mygen));
+    tasks.push(loadKind('arterial', rect, mygen));
+    if (layerOn['oa-excl']) tasks.push(loadKind('oa_excl', rect, mygen));
+    if (z >= (manifest?.lod_aux_min_zoom ?? 13)) tasks.push(loadKind('aux', rect, mygen));
+    setStatus(`<span class="spinner"></span> blocks z=${z.toFixed(1)}`);
+    Promise.allSettled(tasks).then(() => {
+      if (mygen === gen) setStatus(`blocks ready · z=${z.toFixed(1)}`);
+    });
+  }
+
+  function tooltipFor(p, info) {
+    if (!p) return null;
+    if ('block_id' in p && 'area_m2' in p) {
+      const pct = v => v != null ? (v*100).toFixed(0)+'%' : '-';
+      return `<b>block</b> #${p.block_id}<br>
+              major: <b>${p.major_lu||'-'}</b> (${pct(p.major_share)} of buildable)<br>
+              area ${fmt(Math.round(p.area_m2))} m² · ${fmt(p.buildable_parcel_count ?? p.parcel_count)} parcels<br>
+              buildable ${pct(p.buildable_share)} · road ${pct(p.road_share)} · water ${pct(p.water_share)}<br>
+              rail ${pct(p.rail_share)} · public ${pct(p.public_share)}`;
+    }
+    if ('link_id' in p) {
+      return `<b>link</b> #${p.link_id} <i>${p.kind}</i><br>${p.name||'(no name)'}<br>scls ${p.scls} · rddv ${p.rddv}<br>blk ${p.block_id ?? '-'} · w ${p.width_m ?? '-'}m · ln ${p.lanes}`;
+    }
+    return null;
+  }
+
+  function buildPanel() {
+    document.getElementById('title').textContent = 'Superblock + 도로';
+    const k = manifest?.oa_kinds || {};
+    document.getElementById('desc').innerHTML =
+      `간선(ROA_CLS_SE≤3)으로 둘러싸인 <b>${fmt(manifest?.block_count)}</b> 도시 superblock. ` +
+      `산·강 OA(${fmt((k['산지']||0)+(k['수계']||0))}) 는 회색으로 분리. 색은 블록 major 토지이용. 줌 13+ 에서 외곽도로(aux) 추가.`;
+    const tog = document.getElementById('layer-toggles');
+    tog.innerHTML = `
+      <div class="row" data-layer="blocks-fill"><div class="sw" style="background:rgba(255,255,255,0.18);border:1px solid #888;"></div><span>블록 fill</span></div>
+      <div class="row" data-layer="blocks-line"><div class="sw line" style="background:#fff;height:3px;"></div><span>블록 경계 (굵은 흰색)</span></div>
+      <div class="row" data-layer="arterial"><div class="sw line" style="background:linear-gradient(90deg,rgb(255,60,60),rgb(255,140,60),rgb(255,200,80));"></div><span>간선 (등급별)</span></div>
+      <div class="row off" data-layer="aux"><div class="sw line" style="background:rgb(240,200,80);"></div><span>edge / outside</span></div>
+      <div class="row" data-layer="oa-excl"><div class="sw" style="background:rgb(40,80,130);"></div><span>산/강 OA (분석 제외)</span></div>
+      <div style="margin-top:6px;"><span class="toggle on" id="agg-toggle">block fill: ${aggMode}</span></div>
+    `;
+    tog.querySelectorAll('[data-layer]').forEach(el => {
+      el.addEventListener('click', () => {
+        const k = el.dataset.layer;
+        layerOn[k] = !layerOn[k];
+        el.classList.toggle('off', !layerOn[k]);
+        if (layerOn[k]) reload();
+        requestRender();
+      });
+    });
+    tog.querySelector('#agg-toggle').addEventListener('click', e => {
+      const cycle = manifest?.fill_modes || [
+        'major_lu', 'major_share', 'buildable_share',
+        'road_share', 'rail_share', 'water_share', 'public_share',
+        'area', 'none'
+      ];
+      aggMode = cycle[(cycle.indexOf(aggMode)+1) % cycle.length];
+      e.target.textContent = `block fill: ${aggMode}`;
+      buildLegend();
+      requestRender();
+    });
+    buildLegend();
+    renderStats();
+  }
+
+  function buildLegend() {
+    const el = document.getElementById('legend');
+    if (aggMode === 'major_lu') {
+      el.innerHTML = '<div style="margin-bottom:4px;color:#8995ad;font-size:11px;">major_lu (클릭으로 토글)</div>' +
+        ZONE_ORDER.map(k => {
+          const c = ZONE_COLORS[k] || [128,128,128];
+          const off = !zoneVisibility[k] ? ' off' : '';
+          return `<div class="row${off}" data-zone="${k}"><span class="sw" style="background:rgb(${c[0]},${c[1]},${c[2]})"></span><span>${k === '_없음' ? '(필지 없음)' : k}</span></div>`;
+        }).join('');
+      el.querySelectorAll('[data-zone]').forEach(el => {
+        el.addEventListener('click', () => {
+          const k = el.dataset.zone;
+          zoneVisibility[k] = !zoneVisibility[k];
+          el.classList.toggle('off', !zoneVisibility[k]);
+          requestRender();
+        });
+      });
+    } else if (SHARE_RAMPS[aggMode]) {
+      const r = SHARE_RAMPS[aggMode];
+      const grad = `linear-gradient(to right, rgb(${r[0][0]},${r[0][1]},${r[0][2]}), rgb(${r[1][0]},${r[1][1]},${r[1][2]}))`;
+      el.innerHTML = `<div style="margin-bottom:4px;color:#8995ad;font-size:11px;">${aggMode} · 0 → 1</div>
+        <div style="height:14px;background:${grad};border-radius:3px;border:1px solid rgba(255,255,255,0.1);"></div>
+        <div style="display:flex;justify-content:space-between;font-size:10px;color:#7e8aa3;margin-top:2px;"><span>0</span><span>1</span></div>`;
+    } else {
+      el.innerHTML = '';
+    }
+  }
+
+  function renderStats() {
+    if (!manifest) return;
+    document.getElementById('stats').innerHTML = `
+      <b>blocks</b> ${fmt(stores.blocks.size)} / ${fmt(manifest.block_count)}<br>
+      <b>arterial</b> ${fmt(stores.arterial.size)} / ${fmt(manifest.arterial_count)}<br>
+      <b>aux</b> ${fmt(stores.aux.size)} / ${fmt(manifest.aux_count)}
+    `;
+  }
+
+  return { init, buildLayers, buildPanel, reload, tooltipFor, afterRender: renderStats };
+})();
+
+// --- ZONING mode (UQ111) — 국토부 도시지역 raw 용도지역 폴리곤 (6.7k, 고시 단위) ---
+const ZoningUQMode = (() => {
+  let geojson = null;
+  let stats = null;   // {zone_class: {count, area_m2}}
+
+  async function load() {
+    setStatus('<span class="spinner"></span> zoning(UQ111) 로드 중…');
+    geojson = await (await fetch('../derived/seoul_zoning_uq111.geojson')).json();
+    stats = {};
+    geojson.features.forEach(f => {
+      const k = f.properties.zone_class;
+      stats[k] = stats[k] || { count: 0, area_m2: 0 };
+      stats[k].count += 1;
+      stats[k].area_m2 += f.properties.area_m2 || 0;
+    });
+    setStatus(`zoning(UQ111) ready (${fmt(geojson.features.length)} polygons)`);
+  }
+
+  function buildLayers() {
+    if (!geojson) return [];
+    return [new GeoJsonLayer({
+      id: 'zoning-uq',
+      data: geojson,
+      pickable: true, stroked: true, filled: true,
+      getFillColor: f => {
+        const k = f.properties.zone_class;
+        const c = ZONE_COLORS[k] || [128,128,128];
+        return [c[0], c[1], c[2], zoneVisibility[k] ? 180 : 0];
+      },
+      getLineColor: f => {
+        const k = f.properties.zone_class;
+        const c = ZONE_COLORS[k] || [128,128,128];
+        // raw 폴리곤 경계가 보이도록 line alpha 좀 더 진하게
+        return [Math.min(255, c[0]+30), Math.min(255, c[1]+30), Math.min(255, c[2]+30), zoneVisibility[k] ? 220 : 0];
+      },
+      getLineWidth: 0.8, lineWidthUnits: 'pixels', lineWidthMinPixels: 0.5,
+      autoHighlight: true, highlightColor: [255,255,255,80],
+      updateTriggers: {
+        getFillColor: JSON.stringify(zoneVisibility),
+        getLineColor: JSON.stringify(zoneVisibility),
+      }
+    })];
+  }
+
+  async function buildPanel() {
+    document.getElementById('title').textContent = '용도지역 — UQ111 (국토부)';
+    document.getElementById('desc').textContent =
+      'LSMD_CONT_UQ111 (2026-04-04) · 6,692 raw 고시 폴리곤 (dissolve 안함). AL_D154(필지)와 비교용. 9MB.';
+    document.getElementById('layer-toggles').innerHTML = '';
+    if (!geojson) await load();
+    buildLegend();
+    renderStats();
+  }
+
+  function buildLegend() {
+    const el = document.getElementById('legend');
+    if (!stats) { el.innerHTML = ''; return; }
+    el.innerHTML = '<div style="margin-bottom:4px;color:#8995ad;font-size:11px;">11클래스 (클릭으로 토글)</div>' +
+      ZONE_ORDER.filter(k => stats[k]).map(k => {
+        const c = ZONE_COLORS[k];
+        const off = !zoneVisibility[k] ? ' off' : '';
+        return `<div class="row${off}" data-zone="${k}">
+                  <span class="sw" style="background:rgb(${c[0]},${c[1]},${c[2]})"></span>
+                  <span>${k}</span>
+                  <span class="ct">${fmt(stats[k].count)} · ${fmtKm2(stats[k].area_m2)}</span>
+                </div>`;
+      }).join('');
+    el.querySelectorAll('[data-zone]').forEach(el => {
+      el.addEventListener('click', () => {
+        const k = el.dataset.zone;
+        zoneVisibility[k] = !zoneVisibility[k];
+        el.classList.toggle('off', !zoneVisibility[k]);
+        requestRender();
+      });
+    });
+  }
+
+  function tooltipFor(p, info) {
+    if (!p || !('zone_class' in p) || !('mnum' in p)) return null;
+    const meta = [];
+    if (p.ntfdate) meta.push(`고시 ${p.ntfdate}`);
+    if (p.alias)   meta.push(`별칭 ${p.alias}`);
+    if (p.remark)  meta.push(`비고 ${p.remark}`);
+    return `<b>${p.zone_class}</b> (${p.zone_code})<br>
+            면적 ${fmt(p.area_m2)} m²<br>
+            시군구 ${p.sgg_cd || '-'}<br>
+            ${meta.join(' · ') || '<i>메타 없음</i>'}<br>
+            <span style="color:#7e8aa3;font-size:10px;">${p.mnum}</span>`;
+  }
+
+  function renderStats() {
+    if (!geojson) return;
+    const total = Object.values(stats).reduce((s, v) => s + v.area_m2, 0);
+    document.getElementById('stats').innerHTML =
+      `<b>polygons</b> ${fmt(geojson.features.length)}<br><b>area sum</b> ${fmtKm2(total)} <span style="color:#7e8aa3;">(raw, 중복 고시 포함 가능)</span>`;
+  }
+
+  return { init: () => {}, buildLayers, buildPanel, reload: () => {}, tooltipFor, afterRender: () => {} };
+})();
+
+// --- PARCELS mode (MVT 타일 기반) ---
+const ParcelsMode = (() => {
+  const TILE_URL = 'tiles/parcels/{z}/{x}/{y}.pbf';
+  const MIN_ZOOM = 12;
+  const MAX_ZOOM = 15;
+
+  const KIND_COLORS = {
+    '도로':       [ 70,  74,  88, 220],
+    '철도':       [110,  90,  80, 220],
+    '교통':       [ 90,  80, 100, 220],
+    '하천':       [ 50,  90, 130, 220],
+    '농지':       [200, 220, 140, 200],
+    '임야':       [120, 170, 120, 200],
+    '공원·공장':  [140, 200, 160, 200],
+    '공공':       [220, 200, 240, 200],
+    '기타':       [160, 160, 170, 180],
+    '미지정':     [120, 120, 130, 180],
+  };
+  const NON_BUILDABLE = new Set(['도로', '철도', '교통', '하천']);
+  let colorBy = 'zone';
+  let showInfra = true;
+
+  function colorOf(props) {
+    const k = props.jimok_kind || '미지정';
+    const isInfra = NON_BUILDABLE.has(k);
+    if (isInfra && !showInfra) return [0, 0, 0, 0];
+    if (colorBy === 'jimok') {
+      return KIND_COLORS[k] || KIND_COLORS['기타'];
+    }
+    if (isInfra) return KIND_COLORS[k];
+    const zc = props.zone_class;
+    if (!zoneVisibility[zc]) return [0, 0, 0, 0];
+    const c = ZONE_COLORS[zc] || [128,128,128];
+    return [c[0], c[1], c[2], 200];
+  }
+
+  function buildLayers() {
+    return [new MVTLayer({
+      id: 'parcels-mvt',
+      data: TILE_URL,
+      minZoom: MIN_ZOOM,
+      maxZoom: MAX_ZOOM,
+      pickable: true,
+      stroked: true,
+      filled: true,
+      getFillColor: f => colorOf(f.properties),
+      getLineColor: [255,255,255,70],
+      getLineWidth: 0.5, lineWidthUnits: 'pixels',
+      lineWidthMinPixels: 0.3,
+      autoHighlight: true, highlightColor: [255,255,255,90],
+      updateTriggers: {
+        getFillColor: [colorBy, showInfra, JSON.stringify(zoneVisibility)],
+      },
+      onTileLoad: () => requestRender(),
+    })];
+  }
+
+  async function buildPanel() {
+    document.getElementById('title').textContent = '필지 단위 (89.9만 · MVT)';
+    document.getElementById('desc').innerHTML =
+      'LSMD 89.9만 필지 · 사전 타일링(MVT z' + MIN_ZOOM + '–' + MAX_ZOOM + '). 도로/철도/하천 등 비건축은 어두운 톤. ' +
+      '<span style="color:#ffb070">z' + MIN_ZOOM + ' 미만은 표시 안 함.</span>';
+    const tog = document.getElementById('layer-toggles');
+    tog.innerHTML = `
+      <div style="margin-top:4px;">
+        <span class="toggle ${colorBy === 'zone' ? 'on' : ''}" id="parc-color-toggle">color: ${colorBy}</span>
+        <span class="toggle ${showInfra ? 'on' : ''}" id="parc-infra-toggle">${showInfra ? '비건축 ON' : '비건축 OFF'}</span>
+      </div>
+    `;
+    tog.querySelector('#parc-color-toggle').addEventListener('click', e => {
+      colorBy = (colorBy === 'zone') ? 'jimok' : 'zone';
+      e.target.textContent = `color: ${colorBy}`;
+      e.target.classList.toggle('on');
+      buildLegend();
+      requestRender();
+    });
+    tog.querySelector('#parc-infra-toggle').addEventListener('click', e => {
+      showInfra = !showInfra;
+      e.target.textContent = showInfra ? '비건축 ON' : '비건축 OFF';
+      e.target.classList.toggle('on');
+      requestRender();
+    });
+    buildLegend();
+    renderStats();
+  }
+
+  function buildLegend() {
+    const el = document.getElementById('legend');
+    if (colorBy === 'jimok') {
+      const order = ['대지','도로','철도','교통','하천','농지','임야','공원·공장','공공','기타','미지정'];
+      el.innerHTML = '<div style="margin-bottom:4px;color:#8995ad;font-size:11px;">jimok_kind</div>' +
+        order.map(k => {
+          if (k === '대지') {
+            return `<div class="row"><span class="sw" style="background:#aab;border:1px dashed #888;"></span><span>대지 → zone_class 색 사용 안 함</span></div>`;
+          }
+          const c = KIND_COLORS[k] || [128,128,128];
+          return `<div class="row"><span class="sw" style="background:rgb(${c[0]},${c[1]},${c[2]})"></span><span>${k}</span></div>`;
+        }).join('');
+    } else {
+      const infraSwatch = `rgb(${KIND_COLORS['도로'][0]},${KIND_COLORS['도로'][1]},${KIND_COLORS['도로'][2]})`;
+      el.innerHTML = '<div style="margin-bottom:4px;color:#8995ad;font-size:11px;">11클래스 (클릭으로 토글)</div>' +
+        ZONE_ORDER.map(k => {
+          const c = ZONE_COLORS[k] || [128,128,128];
+          const off = !zoneVisibility[k] ? ' off' : '';
+          return `<div class="row${off}" data-zone="${k}"><span class="sw" style="background:rgb(${c[0]},${c[1]},${c[2]})"></span><span>${k}</span></div>`;
+        }).join('') +
+        `<div class="row" style="margin-top:6px;border-top:1px solid rgba(255,255,255,0.1);padding-top:6px;cursor:default;"><span class="sw" style="background:${infraSwatch}"></span><span>도로/철도/하천/교통 (별도)</span></div>`;
+      el.querySelectorAll('[data-zone]').forEach(el => {
+        el.addEventListener('click', () => {
+          const k = el.dataset.zone;
+          zoneVisibility[k] = !zoneVisibility[k];
+          el.classList.toggle('off', !zoneVisibility[k]);
+          requestRender();
+        });
+      });
+    }
+  }
+
+  function tooltipFor(p, info) {
+    if (!p || !('pnu' in p)) return null;
+    const isInfra = NON_BUILDABLE.has(p.jimok_kind);
+    const head = isInfra
+      ? `<b>${p.jimok_kind}</b> (지목 ${p.jimok})`
+      : `<b>${p.zone_class}</b> · 지목 ${p.jimok || '-'} (${p.jimok_kind || '-'})`;
+    return `${head}<br>PNU ${p.pnu}<br>면적 ${fmt(p.area_m2)} m²<br>코드 ${p.zone_code || '-'}`;
+  }
+
+  function renderStats() {
+    document.getElementById('stats').innerHTML = `<b>parcels</b> 899,432 (MVT z${MIN_ZOOM}–${MAX_ZOOM})`;
+  }
+
+  return { init: () => {}, buildLayers, buildPanel, reload: () => requestRender(), tooltipFor, afterRender: renderStats };
+})();
+
+// --- POINTS mode (89.9만 필지 centroid, ScatterplotLayer로 GPU 가속) ---
+const PointsMode = (() => {
+  const FGB_URL = '../derived/seoul_parcels_pts.fgb';
+  // 사전 로드된 typed arrays (ScatterplotLayer는 binary attributes로 가장 빠름)
+  let positions = null;   // Float32Array [lng,lat,...]
+  let radii = null;       // Float32Array (sqrt(area_m2) * 0.5)
+  let zoneIdx = null;     // Uint8Array
+  let kindIdx = null;     // Uint8Array
+  let pnus = null;        // 호버용 string array (sparse 사용)
+  let areas = null;       // Int32Array
+  let count = 0;
+  let loaded = false;
+  let loading = false;
+
+  // jimok_kind 인덱스 (아래 KIND_COLORS 키 순서와 일치)
+  const KIND_INDEX = ['대지','도로','철도','교통','하천','농지','임야','공원·공장','공공','기타','미지정'];
+  const KIND_COLORS_FAST = {
+    '도로':       [ 70,  74,  88],
+    '철도':       [110,  90,  80],
+    '교통':       [ 90,  80, 100],
+    '하천':       [ 50,  90, 130],
+    '농지':       [200, 220, 140],
+    '임야':       [120, 170, 120],
+    '공원·공장':  [140, 200, 160],
+    '공공':       [220, 200, 240],
+    '기타':       [160, 160, 170],
+    '미지정':     [120, 120, 130],
+    '대지':       [200, 200, 200],
+  };
+  const NON_BUILDABLE_IDX = new Set([1, 2, 3, 4]); // 도로 철도 교통 하천
+
+  // zone_class 인덱스 (ZONE_ORDER 사용)
+  const ZONE_INDEX_OF = {};
+  ZONE_ORDER.forEach((k, i) => ZONE_INDEX_OF[k] = i);
+
+  let colorBy = 'zone';
+  let showInfra = true;
+
+  async function load() {
+    if (loaded || loading) return;
+    loading = true;
+    setStatus('<span class="spinner"></span> points 다운로드…');
+
+    // 사이즈 미리 받기 (progress 표시용)
+    let total = 0;
+    try {
+      const head = await fetch(FGB_URL, { method: 'HEAD' });
+      total = +head.headers.get('content-length') || 0;
+    } catch (e) {}
+
+    // 1차 패스로 행 수 추정 — fgb header에는 features count 가 있어 deserialize iterator 시작 후 알 수 있음.
+    // 메모리 절약 위해 동적 typed array 확장.
+    let cap = 1_000_000;
+    positions = new Float32Array(cap * 2);
+    radii = new Float32Array(cap);
+    zoneIdx = new Uint8Array(cap);
+    kindIdx = new Uint8Array(cap);
+    pnus = new Array(cap);
+    areas = new Int32Array(cap);
+
+    // flatgeobuf 3.36+에서 deserialize(url, rect) 필수. 전체 로드를 위해 서울 bbox.
+    const SEOUL_BBOX = { minX: 126.6, minY: 37.3, maxX: 127.3, maxY: 37.8 };
+    let i = 0, lastReport = 0;
+    const t0 = performance.now();
+    try {
+      for await (const f of fgb.deserialize(FGB_URL, SEOUL_BBOX)) {
+        if (i >= cap) {
+          cap *= 2;
+          const np = new Float32Array(cap * 2); np.set(positions); positions = np;
+          const nr = new Float32Array(cap); nr.set(radii); radii = nr;
+          const nz = new Uint8Array(cap); nz.set(zoneIdx); zoneIdx = nz;
+          const nk = new Uint8Array(cap); nk.set(kindIdx); kindIdx = nk;
+          pnus.length = cap;
+          const na = new Int32Array(cap); na.set(areas); areas = na;
+        }
+        const c = f.geometry.coordinates;
+        positions[i*2] = c[0];
+        positions[i*2+1] = c[1];
+        const a = f.properties.area_m2 || 0;
+        areas[i] = a;
+        radii[i] = Math.sqrt(Math.max(a, 1)) * 0.5;
+        zoneIdx[i] = ZONE_INDEX_OF[f.properties.zone_class] ?? 255;
+        const ki = KIND_INDEX.indexOf(f.properties.jimok_kind);
+        kindIdx[i] = ki < 0 ? KIND_INDEX.indexOf('미지정') : ki;
+        pnus[i] = f.properties.pnu;
+        i++;
+        if (i - lastReport >= 80000) {
+          lastReport = i;
+          setStatus(`<span class="spinner"></span> points 로드 ${fmt(i)}…`);
+          requestRender();
+        }
+      }
+    } catch (e) {
+      setStatus('points error: ' + e.message);
+      console.error(e);
+      loading = false;
+      return;
+    }
+    count = i;
+    // trim arrays
+    positions = positions.slice(0, count*2);
+    radii = radii.slice(0, count);
+    zoneIdx = zoneIdx.slice(0, count);
+    kindIdx = kindIdx.slice(0, count);
+    pnus.length = count;
+    areas = areas.slice(0, count);
+    const dt = ((performance.now() - t0) / 1000).toFixed(1);
+    loaded = true;
+    loading = false;
+    // sanity check — 좌표 범위 확인
+    const sampleIdx = Math.floor(count / 2);
+    console.log('[points] loaded', count, 'samples idx=', sampleIdx,
+      'pos=', positions[sampleIdx*2], positions[sampleIdx*2+1],
+      'r=', radii[sampleIdx],
+      'zone=', ZONE_ORDER[zoneIdx[sampleIdx]],
+      'jimok=', KIND_INDEX[kindIdx[sampleIdx]]);
+    setStatus(`points ready · ${fmt(count)} (${dt}s)`);
+    renderStats();
+    requestRender();
+  }
+
+  function colorOf(i) {
+    const ki = kindIdx[i];
+    const isInfra = NON_BUILDABLE_IDX.has(ki);
+    if (isInfra && !showInfra) return [0, 0, 0, 0];
+    if (colorBy === 'jimok') {
+      const c = KIND_COLORS_FAST[KIND_INDEX[ki]] || [128,128,128];
+      return [c[0], c[1], c[2], 220];
+    }
+    if (isInfra) {
+      const c = KIND_COLORS_FAST[KIND_INDEX[ki]];
+      return [c[0], c[1], c[2], 220];
+    }
+    const zk = ZONE_ORDER[zoneIdx[i]];
+    if (zk == null || !zoneVisibility[zk]) return [0, 0, 0, 0];
+    const c = ZONE_COLORS[zk] || [128,128,128];
+    return [c[0], c[1], c[2], 220];
+  }
+
+  function buildLayers() {
+    if (!loaded || count === 0) return [];
+    // deck.gl 표준: data로 length만 가진 객체를 주면 0..length-1 인덱스로 순회.
+    // accessor는 (object, info) 형식이고 object는 undefined, info.index가 인덱스.
+    return [new ScatterplotLayer({
+      id: 'parcels-points',
+      data: { length: count },
+      pickable: true,
+      stroked: false, filled: true,
+      radiusUnits: 'meters',
+      radiusMinPixels: 2.5,
+      radiusMaxPixels: 30,
+      getPosition: (_, info) => [positions[info.index*2], positions[info.index*2+1]],
+      getRadius:   (_, info) => radii[info.index],
+      getFillColor: (_, info) => colorOf(info.index),
+      updateTriggers: {
+        getFillColor: [colorBy, showInfra, JSON.stringify(zoneVisibility)],
+      },
+    })];
+  }
+
+  async function buildPanel() {
+    document.getElementById('title').textContent = '필지 centroid (점, 89.9만)';
+    document.getElementById('desc').innerHTML =
+      '필지 폴리곤을 centroid 점으로 변환 · ScatterplotLayer GPU 가속 · 점 크기 ∝ √area_m2.';
+    const tog = document.getElementById('layer-toggles');
+    tog.innerHTML = `
+      <div style="margin-top:4px;">
+        <span class="toggle ${colorBy === 'zone' ? 'on' : ''}" id="pts-color-toggle">color: ${colorBy}</span>
+        <span class="toggle ${showInfra ? 'on' : ''}" id="pts-infra-toggle">${showInfra ? '비건축 ON' : '비건축 OFF'}</span>
+      </div>
+    `;
+    tog.querySelector('#pts-color-toggle').addEventListener('click', e => {
+      colorBy = (colorBy === 'zone') ? 'jimok' : 'zone';
+      e.target.textContent = `color: ${colorBy}`;
+      e.target.classList.toggle('on');
+      buildLegend();
+      requestRender();
+    });
+    tog.querySelector('#pts-infra-toggle').addEventListener('click', e => {
+      showInfra = !showInfra;
+      e.target.textContent = showInfra ? '비건축 ON' : '비건축 OFF';
+      e.target.classList.toggle('on');
+      requestRender();
+    });
+    buildLegend();
+    if (!loaded) await load();
+    renderStats();
+  }
+
+  function buildLegend() {
+    const el = document.getElementById('legend');
+    if (colorBy === 'jimok') {
+      const order = ['대지','도로','철도','교통','하천','농지','임야','공원·공장','공공','기타','미지정'];
+      el.innerHTML = '<div style="margin-bottom:4px;color:#8995ad;font-size:11px;">jimok_kind</div>' +
+        order.map(k => {
+          if (k === '대지') {
+            return `<div class="row"><span class="sw" style="background:#aab;border:1px dashed #888;"></span><span>대지 → 무색 (zone 모드 전환)</span></div>`;
+          }
+          const c = KIND_COLORS_FAST[k] || [128,128,128];
+          return `<div class="row"><span class="sw" style="background:rgb(${c[0]},${c[1]},${c[2]})"></span><span>${k}</span></div>`;
+        }).join('');
+    } else {
+      const infraSwatch = `rgb(${KIND_COLORS_FAST['도로'][0]},${KIND_COLORS_FAST['도로'][1]},${KIND_COLORS_FAST['도로'][2]})`;
+      el.innerHTML = '<div style="margin-bottom:4px;color:#8995ad;font-size:11px;">11클래스 (클릭으로 토글)</div>' +
+        ZONE_ORDER.map(k => {
+          const c = ZONE_COLORS[k] || [128,128,128];
+          const off = !zoneVisibility[k] ? ' off' : '';
+          return `<div class="row${off}" data-zone="${k}"><span class="sw" style="background:rgb(${c[0]},${c[1]},${c[2]})"></span><span>${k}</span></div>`;
+        }).join('') +
+        `<div class="row" style="margin-top:6px;border-top:1px solid rgba(255,255,255,0.1);padding-top:6px;cursor:default;"><span class="sw" style="background:${infraSwatch}"></span><span>도로/철도/하천/교통 (별도)</span></div>`;
+      el.querySelectorAll('[data-zone]').forEach(el => {
+        el.addEventListener('click', () => {
+          const k = el.dataset.zone;
+          zoneVisibility[k] = !zoneVisibility[k];
+          el.classList.toggle('off', !zoneVisibility[k]);
+          requestRender();
+        });
+      });
+    }
+  }
+
+  function tooltipFor(_, info) {
+    if (!info || info.index == null || info.index < 0) return null;
+    const i = info.index;
+    if (i >= count) return null;
+    const zk = ZONE_ORDER[zoneIdx[i]] || '-';
+    const jk = KIND_INDEX[kindIdx[i]] || '-';
+    const isInfra = NON_BUILDABLE_IDX.has(kindIdx[i]);
+    const head = isInfra ? `<b>${jk}</b>` : `<b>${zk}</b> · ${jk}`;
+    return `${head}<br>PNU ${pnus[i]}<br>면적 ${fmt(areas[i])} m²`;
+  }
+
+  function renderStats() {
+    document.getElementById('stats').innerHTML = loaded
+      ? `<b>points</b> ${fmt(count)} (loaded)`
+      : `<b>points</b> 0 (대기)`;
+  }
+
+  return { init: () => {}, buildLayers, buildPanel,
+           reload: () => {}, tooltipFor, afterRender: renderStats };
+})();
+
+// --- STATS mode (OA 통계 + 시간대별 생활인구) ---
+const StatsMode = (() => {
+  const FGB_URL = 'oa_stats.fgb';
+  const ADM_URL = 'adm.fgb';
+  const BLK_URL = 'blocks.fgb';
+  const cache = new Map();           // oa_cd -> feature
+  const admStore  = new Map();       // adm_cd -> feature
+  const blkStore  = new Map();       // block_id -> feature
+  let manifest = null;
+  let token = 0;
+  let timer = null;
+  // metric 또는 'kind'
+  let metric = 'pop_density';
+  let selectedBlock = null;
+  // boundary layer 토글
+  const layerOn = { 'oa-fill': true, 'adm-line': true, 'blk-line': true };
+
+  // metric 별 quantile breaks (max 2-pass: data 들어오면 갱신)
+  let breaks = null;   // {min, max, p10, p50, p90}
+  // viridis-like ramp
+  const RAMP = [
+    [ 68,   1,  84],
+    [ 71,  44, 122],
+    [ 59,  81, 139],
+    [ 44, 113, 142],
+    [ 33, 144, 141],
+    [ 39, 173, 129],
+    [ 92, 200,  99],
+    [170, 220,  50],
+    [253, 231,  37],
+  ];
+  function rampColor(t) {
+    t = Math.max(0, Math.min(1, t));
+    const x = t * (RAMP.length - 1);
+    const i = Math.floor(x), f = x - i;
+    const a = RAMP[i], b = RAMP[Math.min(i+1, RAMP.length-1)];
+    return [Math.round(a[0]+(b[0]-a[0])*f),
+            Math.round(a[1]+(b[1]-a[1])*f),
+            Math.round(a[2]+(b[2]-a[2])*f), 220];
+  }
+  const KIND_COLOR = {
+    '도시': [200, 180, 130, 200],
+    '산지': [ 80, 140,  80, 200],
+    '수계': [ 70, 130, 200, 200],
+  };
+
+  function recomputeBreaks() {
+    if (metric === 'kind') { breaks = null; return; }
+    const arr = [];
+    for (const f of cache.values()) {
+      const v = f.properties[metric];
+      if (v != null && isFinite(v)) arr.push(v);
+    }
+    if (!arr.length) { breaks = null; return; }
+    arr.sort((a,b)=>a-b);
+    const q = p => arr[Math.floor((arr.length-1) * p)];
+    // log-scale 가능한 metric (밀도·생활인구) 은 p99 cap
+    breaks = { min: arr[0], max: arr[arr.length-1],
+               p05: q(0.05), p50: q(0.50), p95: q(0.95) };
+  }
+
+  function colorOf(props) {
+    if (metric === 'kind') {
+      const c = KIND_COLOR[props.kind] || [120,120,120,180];
+      const a = (selectedBlock!=null && props.block_id===selectedBlock) ? 245 : c[3];
+      return [c[0], c[1], c[2], a];
+    }
+    if (!breaks) return [60,60,80,160];
+    const v = props[metric];
+    if (v == null || !isFinite(v)) return [50,50,55,100];
+    // 산/강 OA 는 metric 표시 무의미 → 회색 톤
+    if (props.kind !== '도시') return [70,70,80,140];
+    // p05~p95 normalize (outlier cap)
+    const lo = breaks.p05, hi = Math.max(breaks.p95, lo + 1e-6);
+    const t = (v - lo) / (hi - lo);
+    const c = rampColor(t);
+    if (selectedBlock!=null && props.block_id===selectedBlock) c[3] = 250;
+    return c;
+  }
+
+  function buildLayers() {
+    const layers = [];
+    // OA fill (가장 아래)
+    if (layerOn['oa-fill']) {
+      const arr = Array.from(cache.values());
+      layers.push(new GeoJsonLayer({
+        id: 'stats-oa',
+        data: arr,
+        pickable: true, stroked: true, filled: true,
+        getFillColor: f => colorOf(f.properties),
+        getLineColor: f => (selectedBlock!=null && f.properties.block_id===selectedBlock)
+          ? [255,255,255,255] : [255,255,255,25],
+        getLineWidth: f => (selectedBlock!=null && f.properties.block_id===selectedBlock) ? 1.6 : 0.25,
+        lineWidthUnits: 'pixels', lineWidthMinPixels: 0.25,
+        updateTriggers: {
+          getFillColor: [metric, selectedBlock, breaks && breaks.p50],
+          getLineColor: selectedBlock,
+          getLineWidth: selectedBlock,
+        }
+      }));
+    }
+    // superblock 경계 — cyan, 1.0px
+    if (layerOn['blk-line']) {
+      const blkArr = Array.from(blkStore.values());
+      layers.push(new GeoJsonLayer({
+        id: 'stats-blk-line',
+        data: blkArr,
+        stroked: true, filled: false, pickable: false,
+        getLineColor: [120, 220, 240, 200],
+        getLineWidth: 1.2, lineWidthUnits: 'pixels', lineWidthMinPixels: 1.0,
+      }));
+    }
+    // 행정동 경계 — 옅은 노란색, 1.8px (가장 위, 두꺼움)
+    if (layerOn['adm-line']) {
+      const admArr = Array.from(admStore.values());
+      layers.push(new GeoJsonLayer({
+        id: 'stats-adm-line',
+        data: admArr,
+        stroked: true, filled: false, pickable: false,
+        getLineColor: [255, 230, 130, 230],
+        getLineWidth: 2.0, lineWidthUnits: 'pixels', lineWidthMinPixels: 1.4,
+      }));
+    }
+    return layers;
+  }
+
+  async function init() {
+    try { manifest = await (await fetch('manifest.json?v=' + Date.now())).json(); }
+    catch (e) {}
+  }
+  function scheduleFetch() {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(doFetch, 250);
+  }
+  async function loadFgb(url, store, idKey, my) {
+    let added = 0;
+    try {
+      for await (const f of fgb.deserialize(url, currentBbox())) {
+        if (my !== token || activeMode !== 'stats') return;
+        const k = f.properties[idKey];
+        if (k != null && !store.has(k)) {
+          store.set(k, f);
+          added++;
+          if (added % 200 === 0) requestRender();
+        }
+      }
+    } catch (e) { console.warn('[stats]', url, e); }
+  }
+  async function doFetch() {
+    if (activeMode !== 'stats') return;
+    const my = ++token;
+    setStatus(`<span class="spinner"></span> stats z=${viewState.zoom.toFixed(1)}`);
+    let added = 0;
+    const tasks = [];
+    // OA fill (필수)
+    tasks.push((async () => {
+      try {
+        for await (const f of fgb.deserialize(FGB_URL, currentBbox())) {
+          if (my !== token || activeMode !== 'stats') return;
+          const k = f.properties.oa_cd;
+          if (!cache.has(k)) {
+            cache.set(k, f);
+            added++;
+            if (added % 2000 === 0) { recomputeBreaks(); requestRender(); }
+          }
+        }
+      } catch (e) { console.warn('[stats] oa', e); }
+    })());
+    if (layerOn['adm-line']) tasks.push(loadFgb(ADM_URL, admStore, 'adm_cd', my));
+    if (layerOn['blk-line']) tasks.push(loadFgb(BLK_URL, blkStore, 'block_id', my));
+    try {
+      await Promise.allSettled(tasks);
+      if (my !== token) return;
+      recomputeBreaks();
+      requestRender();
+      setStatus(`stats ready · OA ${fmt(cache.size)}/${fmt(manifest?.oa_count)} · 동 ${fmt(admStore.size)} · blk ${fmt(blkStore.size)}`);
+    } catch (e) {
+      setStatus('stats error: ' + e.message);
+      console.error(e);
+    }
+  }
+
+  async function buildPanel() {
+    document.getElementById('title').textContent = '통계 (OA 단위)';
+    document.getElementById('desc').innerHTML =
+      `19,097 OA × SGIS 2024 인구·가구·주택 + 2024-12 LOCAL_PEOPLE 시간대 풀. ` +
+      `<b>${manifest?.oa_kinds ? '도시 '+fmt(manifest.oa_kinds['도시'])+' / 산 '+fmt(manifest.oa_kinds['산지'])+' / 강 '+fmt(manifest.oa_kinds['수계']) : ''}</b>`;
+    const tog = document.getElementById('layer-toggles');
+    const metrics = manifest?.stats_metrics || [];
+    const pills = metrics.map(m =>
+      `<span class="toggle ${metric===m.key?'on':''}" data-metric="${m.key}" title="${m.label}">${m.label}</span>`
+    ).join(' ');
+    tog.innerHTML = `
+      <div style="display:flex; flex-wrap:wrap; gap:3px; margin-top:4px;">${pills}</div>
+      <div style="margin-top:6px;">
+        <span class="toggle ${metric==='kind'?'on':''}" data-metric="kind">kind (도시/산/강)</span>
+      </div>
+      <div style="margin-top:8px;border-top:1px solid rgba(255,255,255,0.08);padding-top:6px;">
+        <div style="color:#8995ad;font-size:11px;margin-bottom:4px;">경계 표시</div>
+        <div class="row${layerOn['oa-fill']?'':' off'}" data-layer="oa-fill"><div class="sw" style="background:rgba(120,120,140,0.5);"></div><span>OA fill (통계)</span></div>
+        <div class="row${layerOn['blk-line']?'':' off'}" data-layer="blk-line"><div class="sw line" style="background:rgb(120,220,240);"></div><span>superblock 경계 (cyan)</span></div>
+        <div class="row${layerOn['adm-line']?'':' off'}" data-layer="adm-line"><div class="sw line" style="background:rgb(255,230,130);height:3px;"></div><span>행정동 경계 (노랑, 굵게)</span></div>
+      </div>
+      <div style="margin-top:6px;font-size:11px;color:#8995ad;">
+        OA 클릭 시 같은 superblock 의 OA 들 강조 (산/강 OA 는 회색).
+      </div>`;
+    tog.querySelectorAll('[data-metric]').forEach(el => {
+      el.addEventListener('click', () => {
+        metric = el.dataset.metric;
+        tog.querySelectorAll('[data-metric]').forEach(x =>
+          x.classList.toggle('on', x.dataset.metric === metric));
+        recomputeBreaks();
+        buildLegend();
+        requestRender();
+      });
+    });
+    tog.querySelectorAll('[data-layer]').forEach(el => {
+      el.addEventListener('click', () => {
+        const k = el.dataset.layer;
+        layerOn[k] = !layerOn[k];
+        el.classList.toggle('off', !layerOn[k]);
+        if (layerOn[k]) scheduleFetch();
+        requestRender();
+      });
+    });
+    buildLegend();
+    renderStats();
+    scheduleFetch();
+  }
+
+  function buildLegend() {
+    const el = document.getElementById('legend');
+    if (metric === 'kind') {
+      el.innerHTML = '<div style="color:#8995ad;font-size:11px;margin-bottom:4px;">OA 종류</div>' +
+        Object.entries(KIND_COLOR).map(([k,c]) =>
+          `<div class="row"><span class="sw" style="background:rgb(${c[0]},${c[1]},${c[2]})"></span><span>${k}</span></div>`
+        ).join('');
+      return;
+    }
+    const meta = (manifest?.stats_metrics || []).find(m => m.key === metric);
+    const grad = `linear-gradient(to right, ${RAMP.map(c=>'rgb('+c[0]+','+c[1]+','+c[2]+')').join(',')})`;
+    const lo = breaks ? breaks.p05.toFixed(0) : '-';
+    const hi = breaks ? breaks.p95.toFixed(0) : '-';
+    el.innerHTML = `
+      <div style="color:#8995ad;font-size:11px;margin-bottom:4px;">${meta?.label||metric} <span style="float:right;color:#7e8aa3;">${meta?.unit||''}</span></div>
+      <div style="height:14px;background:${grad};border-radius:3px;border:1px solid rgba(255,255,255,0.1);"></div>
+      <div style="display:flex;justify-content:space-between;font-size:10.5px;color:#7e8aa3;margin-top:2px;">
+        <span>p05 ${lo}</span><span>p95 ${hi}</span>
+      </div>
+      <div style="margin-top:6px;font-size:10.5px;color:#9aa3b8;">산·강 OA 는 회색 (분석 제외).</div>`;
+  }
+
+  function renderStats() {
+    document.getElementById('stats').innerHTML =
+      `<b>OA cache</b> ${fmt(cache.size)} / ${fmt(manifest?.oa_count ?? '?')}` +
+      (breaks ? `<br>p05 ${fmt(breaks.p05.toFixed(0))} · p50 ${fmt(breaks.p50.toFixed(0))} · p95 ${fmt(breaks.p95.toFixed(0))}` : '');
+  }
+
+  function tooltipFor(p) {
+    if (!p || !('oa_cd' in p)) return null;
+    const v = p[metric];
+    const meta = (manifest?.stats_metrics || []).find(m => m.key === metric);
+    const metricLine = (metric === 'kind')
+      ? `kind <b>${p.kind}</b>`
+      : `${meta?.label||metric}: <b>${typeof v==='number' ? v.toFixed(v<10?2:0) : '-'}</b> ${meta?.unit||''}`;
+    return `<b>OA</b> ${p.oa_cd} · 동 ${p.adm_cd}<br>
+            kind <b>${p.kind}</b> · superblock #${p.block_id}<br>
+            ${metricLine}<br>
+            인구 ${fmt(Math.round(p.pop_total))} (밀도 ${fmt(Math.round(p.pop_density))}) · 가구 ${fmt(Math.round(p.ga_total))} · 주택 ${fmt(Math.round(p.ho_total))}<br>
+            생활인구 24h ${fmt(Math.round(p.lp_24h))}`;
+  }
+  function onClick(info) {
+    if (activeMode !== 'stats') return;
+    const p = info && info.object && info.object.properties;
+    if (!p || !('oa_cd' in p)) { selectedBlock = null; }
+    else { selectedBlock = (p.block_id === selectedBlock) ? null : p.block_id; }
+    requestRender();
+  }
+  return { init, buildLayers, buildPanel, reload: scheduleFetch, tooltipFor, afterRender: renderStats, onClick };
+})();
+
+// --- ROAD mode (raw centerline N3L_A0020000_11 414k link 손실 없이 시각화) ---
+const RoadMode = (() => {
+  const stores = { roads: new Map(), blocks: new Map() };
+  const URL_ROAD = 'roads_raw.fgb';
+  const URL_BLK  = 'blocks.fgb';
+  const layerOn = { roads: true, 'blocks-bg': true };
+  let manifest = null;
+  const inflight = {};
+  let gen = 0;
+
+  // 차선 수 별 색·굵기 — 위계의 1차 신호.
+  // 짙은 회색-청록 (1차선 골목) → 진한 빨강 (8+차선 대로) 시퀀셜.
+  // 5번째 자리(rank)가 시각 위계의 핵심.
+  const LANE_COLOR = [
+    [ 90, 100, 120, 150],  // 0/1차선 (골목, 압도적 다수 → 흐릿하게)
+    [120, 140, 160, 175],  // 2차선
+    [200, 180, 110, 215],  // 3
+    [255, 160,  70, 230],  // 4
+    [255, 110,  60, 240],  // 5
+    [255,  70,  60, 245],  // 6
+    [240,  40,  70, 250],  // 7
+    [220,  20,  90, 255],  // 8+
+  ];
+  const LANE_WIDTH = [0.6, 1.0, 1.6, 2.4, 3.2, 4.2, 5.4, 6.8];   // 1 → 8+
+  function laneIdx(n) {
+    const i = Math.max(1, Math.min(8, n|0)) - 1;
+    return i;
+  }
+  // 줌별 차선 임계값 — 멀리서는 큰 도로만, 가까우면 골목까지.
+  function laneThreshold(z) {
+    if (z < 11) return 5;
+    if (z < 12) return 4;
+    if (z < 13) return 3;
+    if (z < 14) return 2;
+    return 1;
+  }
+
+  // 도로 폭 ramp (보조)
+  const RAMP_WIDTH = [[ 20,  40,  70], [120, 240, 200]];
+  function rampColor(t, ramp) {
+    t = Math.max(0, Math.min(1, t));
+    const [a, b] = ramp;
+    return [Math.round(a[0]+(b[0]-a[0])*t),
+            Math.round(a[1]+(b[1]-a[1])*t),
+            Math.round(a[2]+(b[2]-a[2])*t), 230];
+  }
+
+  // SCLS — 서울 raw 에서 의미 있는 분류는 사실상 두 군데:
+  // A0023119 (특별·광역시도/시도 본선) vs A0023210 등 (구도/골목)
+  const SCLS_DEF = {
+    A00231: { color: [255, 130,  60, 240], label: '특별·광역시도' },
+    A00232: { color: [180, 200, 230, 200], label: '구·군도' },
+    _other: { color: [120, 130, 150, 175], label: '기타' },
+  };
+  function sclsKey(scls) {
+    if (!scls) return '_other';
+    if (scls.startsWith('A00231')) return 'A00231';
+    if (scls.startsWith('A00232')) return 'A00232';
+    if (scls.startsWith('A00233')) return 'A00232';
+    return '_other';
+  }
+  function sclsColor(scls) {
+    return (SCLS_DEF[sclsKey(scls)] || SCLS_DEF._other).color;
+  }
+
+  let colorBy = 'lanes';   // lanes | width_m | scls
+  let widthBy = 'lanes';   // lanes | width_m
+  let minLane = null;      // null = 줌별 자동, number = 강제 임계값
+
+  function colorOf(p) {
+    if (colorBy === 'lanes')   return LANE_COLOR[laneIdx(p.lanes)];
+    if (colorBy === 'width_m') return rampColor((p.width_m||0)/50, RAMP_WIDTH);
+    if (colorBy === 'scls')    return sclsColor(p.scls);
+    return [200,200,200,200];
+  }
+  function widthOf(p) {
+    if (widthBy === 'lanes')   return LANE_WIDTH[laneIdx(p.lanes)];
+    if (widthBy === 'width_m') return Math.max(0.6, Math.min(8, (p.width_m||0) * 0.18));
+    return 1.2;
+  }
+  // z-order: 차선 작은 것부터 그려서 큰 도로가 위에 덮이도록.
+  function sortByLanesAsc(arr) {
+    return arr.slice().sort((a, b) => (a.properties.lanes||0) - (b.properties.lanes||0));
+  }
+
+  async function init() {
+    manifest = await (await fetch('manifest.json?v=' + Date.now())).json();
+  }
+
+  function buildLayers() {
+    const layers = [];
+    if (layerOn['blocks-bg']) {
+      const blkArr = Array.from(stores.blocks.values());
+      layers.push(new GeoJsonLayer({
+        id: 'road-blocks-bg', data: blkArr,
+        stroked: true, filled: true, pickable: false,
+        getFillColor: [25, 30, 50, 180],
+        getLineColor: [255,255,255,35],
+        lineWidthUnits: 'pixels', getLineWidth: 0.4, lineWidthMinPixels: 0.4,
+      }));
+    }
+    if (layerOn['roads'] && stores.roads.size) {
+      const thr = minLane ?? laneThreshold(viewState.zoom);
+      const filtered = [];
+      for (const f of stores.roads.values()) {
+        if ((f.properties.lanes||0) >= thr) filtered.push(f);
+      }
+      const sorted = sortByLanesAsc(filtered);
+      layers.push(new GeoJsonLayer({
+        id: 'road-lines', data: sorted,
+        stroked: true, filled: false, pickable: true,
+        getLineColor: f => colorOf(f.properties),
+        lineWidthUnits: 'pixels',
+        getLineWidth: f => widthOf(f.properties),
+        lineWidthMinPixels: 0.5,
+        capRounded: true, jointRounded: true,
+        updateTriggers: {
+          getLineColor: colorBy,
+          getLineWidth: widthBy,
+        }
+      }));
+    }
+    return layers;
+  }
+
+  async function loadFgb(url, store, key, mygen) {
+    if (inflight[key]) inflight[key].cancelled = true;
+    const tok = { cancelled: false };
+    inflight[key] = tok;
+    let added = 0;
+    try {
+      for await (const f of fgb.deserialize(url, currentBbox())) {
+        if (tok.cancelled || mygen !== gen || activeMode !== 'road') return;
+        const id = f.properties[key === 'roads' ? 'link_id' : 'block_id'];
+        if (id == null) continue;
+        if (!store.has(id)) {
+          store.set(id, f);
+          added++;
+          if (added % 4000 === 0) { renderStats(); requestRender(); }
+        }
+      }
+    } catch (e) { console.warn('[road]', url, e); }
+    if (!tok.cancelled) { renderStats(); requestRender(); }
+  }
+
+  function reload() {
+    const mygen = ++gen;
+    const z = viewState.zoom;
+    const tasks = [];
+    if (layerOn['blocks-bg']) tasks.push(loadFgb(URL_BLK, stores.blocks, 'blocks', mygen));
+    if (layerOn['roads'])     tasks.push(loadFgb(URL_ROAD, stores.roads, 'roads', mygen));
+    setStatus(`<span class="spinner"></span> road z=${z.toFixed(1)}  thr=${minLane ?? laneThreshold(z)}+ 차선`);
+    Promise.allSettled(tasks).then(() => {
+      if (mygen === gen) setStatus(`road ready · z=${z.toFixed(1)} · cache ${fmt(stores.roads.size)}`);
+    });
+  }
+
+  function tooltipFor(p) {
+    if (!p || !('link_id' in p)) return null;
+    const sk = sclsKey(p.scls);
+    return `<b>${p.name || '(이름 없음)'}</b><br>
+            차선 <b>${fmt(p.lanes)}</b> · 폭 <b>${p.width_m ? p.width_m.toFixed(1)+' m' : '-'}</b><br>
+            등급 ${(SCLS_DEF[sk]||SCLS_DEF._other).label} (${p.scls||'-'})<br>
+            rddv ${p.rddv||'-'} · ufid ${p.ufid||'-'}<br>
+            <span style="color:#7e8aa3;font-size:10px;">link #${p.link_id}</span>`;
+  }
+
+  function buildPanel() {
+    document.getElementById('title').textContent = '도로 — raw centerline';
+    document.getElementById('desc').innerHTML =
+      `N3L_A0020000_11 (MOLIT) <b>${fmt(manifest?.road_raw_count || 0)}</b> link 전체 보존 ` +
+      `(arterial/aux export 단계에서 빠진 inside 골목 포함). 위계는 <b>차선 수</b>로 구분 — ` +
+      `짙은 회색(1차선) → 진한 빨강(8+차선). 줌별 자동 thinning.`;
+    const tog = document.getElementById('layer-toggles');
+    tog.innerHTML = `
+      <div class="row" data-layer="blocks-bg"><div class="sw" style="background:rgb(25,30,50);border:1px solid #555;"></div><span>블록 silhouette</span></div>
+      <div class="row" data-layer="roads"><div class="sw line" style="background:linear-gradient(90deg,rgb(120,140,160),rgb(255,160,70),rgb(220,20,90));"></div><span>도로 (raw centerline)</span></div>
+      <div style="margin-top:8px;border-top:1px solid rgba(255,255,255,0.08);padding-top:6px;">
+        <div style="color:#8995ad;font-size:11px;margin-bottom:4px;">color by</div>
+        <span class="toggle ${colorBy==='lanes'?'on':''}" data-color="lanes">lanes 차선</span>
+        <span class="toggle ${colorBy==='width_m'?'on':''}" data-color="width_m">width_m 폭</span>
+        <span class="toggle ${colorBy==='scls'?'on':''}" data-color="scls">scls 등급</span>
+      </div>
+      <div style="margin-top:6px;">
+        <div style="color:#8995ad;font-size:11px;margin-bottom:4px;">width by</div>
+        <span class="toggle ${widthBy==='lanes'?'on':''}" data-width="lanes">lanes</span>
+        <span class="toggle ${widthBy==='width_m'?'on':''}" data-width="width_m">width_m</span>
+      </div>
+      <div style="margin-top:6px;">
+        <div style="color:#8995ad;font-size:11px;margin-bottom:4px;">최소 차선 수 (force, null=auto)</div>
+        <span class="toggle ${minLane==null?'on':''}" data-thr="auto">auto</span>
+        <span class="toggle ${minLane===1?'on':''}" data-thr="1">1+</span>
+        <span class="toggle ${minLane===2?'on':''}" data-thr="2">2+</span>
+        <span class="toggle ${minLane===3?'on':''}" data-thr="3">3+</span>
+        <span class="toggle ${minLane===4?'on':''}" data-thr="4">4+</span>
+        <span class="toggle ${minLane===5?'on':''}" data-thr="5">5+</span>
+      </div>
+    `;
+    tog.querySelectorAll('[data-layer]').forEach(el => {
+      el.classList.toggle('off', !layerOn[el.dataset.layer]);
+      el.addEventListener('click', () => {
+        const k = el.dataset.layer;
+        layerOn[k] = !layerOn[k];
+        el.classList.toggle('off', !layerOn[k]);
+        if (layerOn[k]) reload();
+        requestRender();
+      });
+    });
+    tog.querySelectorAll('[data-color]').forEach(el => {
+      el.addEventListener('click', () => {
+        colorBy = el.dataset.color;
+        tog.querySelectorAll('[data-color]').forEach(x =>
+          x.classList.toggle('on', x.dataset.color === colorBy));
+        buildLegend();
+        requestRender();
+      });
+    });
+    tog.querySelectorAll('[data-width]').forEach(el => {
+      el.addEventListener('click', () => {
+        widthBy = el.dataset.width;
+        tog.querySelectorAll('[data-width]').forEach(x =>
+          x.classList.toggle('on', x.dataset.width === widthBy));
+        requestRender();
+      });
+    });
+    tog.querySelectorAll('[data-thr]').forEach(el => {
+      el.addEventListener('click', () => {
+        const v = el.dataset.thr;
+        minLane = (v === 'auto') ? null : parseInt(v, 10);
+        tog.querySelectorAll('[data-thr]').forEach(x =>
+          x.classList.toggle('on', x.dataset.thr === v));
+        requestRender();
+      });
+    });
+    buildLegend();
+    renderStats();
+  }
+
+  function buildLegend() {
+    const el = document.getElementById('legend');
+    if (colorBy === 'lanes') {
+      el.innerHTML = '<div style="margin-bottom:4px;color:#8995ad;font-size:11px;">차선 수 — 위계</div>' +
+        LANE_COLOR.map((c, i) => {
+          const lab = i === 0 ? '0–1차선 (골목)' : i === 7 ? '8+차선 (대로)' : (i+1)+'차선';
+          const w = LANE_WIDTH[i];
+          return `<div class="row"><span class="sw line" style="background:rgb(${c[0]},${c[1]},${c[2]});height:${Math.max(2, w*0.7)}px;"></span><span>${lab}</span></div>`;
+        }).join('');
+    } else if (colorBy === 'scls') {
+      el.innerHTML = '<div style="margin-bottom:4px;color:#8995ad;font-size:11px;">scls 도로 분류</div>' +
+        Object.entries(SCLS_DEF).map(([k, d]) => {
+          const c = d.color;
+          return `<div class="row"><span class="sw line" style="background:rgb(${c[0]},${c[1]},${c[2]});height:3px;"></span><span>${d.label} <span class="ct">${k}</span></span></div>`;
+        }).join('');
+    } else if (colorBy === 'width_m') {
+      const r = RAMP_WIDTH;
+      const grad = `linear-gradient(to right, rgb(${r[0][0]},${r[0][1]},${r[0][2]}), rgb(${r[1][0]},${r[1][1]},${r[1][2]}))`;
+      el.innerHTML = `<div style="margin-bottom:4px;color:#8995ad;font-size:11px;">width_m 도로 폭</div>
+        <div style="height:14px;background:${grad};border-radius:3px;border:1px solid rgba(255,255,255,0.1);"></div>
+        <div style="display:flex;justify-content:space-between;font-size:10px;color:#7e8aa3;margin-top:2px;"><span>0 m</span><span>50 m</span></div>`;
+    }
+  }
+
+  function renderStats() {
+    if (!manifest) return;
+    const z = viewState.zoom;
+    const thr = minLane ?? laneThreshold(z);
+    let visibleCount = 0;
+    for (const f of stores.roads.values()) {
+      if ((f.properties.lanes||0) >= thr) visibleCount++;
+    }
+    document.getElementById('stats').innerHTML = `
+      <b>roads</b> ${fmt(stores.roads.size)} cached / ${fmt(manifest.road_raw_count || '?')} total<br>
+      <b>visible</b> ${fmt(visibleCount)} (${thr}+ 차선)<br>
+      <b>blocks</b> ${fmt(stores.blocks.size)} / ${fmt(manifest.block_count)}
+    `;
+  }
+
+  return { init, buildLayers, buildPanel, reload, tooltipFor, afterRender: renderStats };
+})();
+
+const MODES = { blocks: BlocksMode, road: RoadMode, zoning_uq: ZoningUQMode, parcels: ParcelsMode, points: PointsMode, stats: StatsMode };
+
+let deckInstance;
+let pendingFrame;
+function requestRender() {
+  if (pendingFrame) return;
+  pendingFrame = requestAnimationFrame(() => {
+    pendingFrame = null;
+    deckInstance.setProps({ layers: MODES[activeMode].buildLayers() });
+    MODES[activeMode].afterRender();
+  });
+}
+
+function currentBbox(padOverride) {
+  const w = window.innerWidth, h = window.innerHeight;
+  const dpp = 360 / (256 * Math.pow(2, viewState.zoom));
+  const halfW = (w / 2) * dpp / Math.cos(viewState.latitude * Math.PI / 180);
+  const halfH = (h / 2) * dpp;
+  // mode별 padding: blocks/aux은 인접 영역 미리 받아두는 게 자연스러우나
+  // parcels(폴리곤)·road(414k link)는 데이터가 무거워 padding을 좁혀 fetch 양 절감.
+  const pad = padOverride ?? (activeMode === 'parcels' ? 1.05
+                            : activeMode === 'road'    ? 1.05
+                            : 1.2);
+  return {
+    minX: viewState.longitude - halfW * pad,
+    maxX: viewState.longitude + halfW * pad,
+    minY: viewState.latitude - halfH * pad,
+    maxY: viewState.latitude + halfH * pad,
+  };
+}
+
+let viewTimer = null;
+function onViewChange(vs) {
+  viewState = vs;
+  deckInstance.setProps({ viewState });
+  if (viewTimer) clearTimeout(viewTimer);
+  viewTimer = setTimeout(() => MODES[activeMode].reload(), 220);
+}
+
+async function setMode(name) {
+  activeMode = name;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.mode === name));
+  await MODES[name].buildPanel();
+  MODES[name].reload();
+  requestRender();
+}
+
+document.querySelectorAll('.tab').forEach(el => {
+  el.addEventListener('click', () => setMode(el.dataset.mode));
+});
+
+(async () => {
+  await BlocksMode.init();
+  await RoadMode.init();
+  await StatsMode.init();
+  deckInstance = new DeckGL({
+    container: 'map',
+    mapStyle: MAP_STYLE,
+    initialViewState: viewState,
+    controller: true,
+    onViewStateChange: ({viewState: vs}) => onViewChange(vs),
+    onClick: (info) => {
+      const m = MODES[activeMode];
+      if (m && m.onClick) m.onClick(info);
+    },
+    layers: [],
+    getTooltip: (info) => {
+      const { object, x, y } = info;
+      if (object == null && info.index == null) { tooltip.style.display = 'none'; return null; }
+      // PointsMode는 binary 데이터라 properties가 없고 info.index 사용
+      const tip = MODES[activeMode].tooltipFor(object && object.properties, info);
+      if (!tip) { tooltip.style.display = 'none'; return null; }
+      tooltip.innerHTML = tip;
+      tooltip.style.left = x + 'px';
+      tooltip.style.top = y + 'px';
+      tooltip.style.display = 'block';
+      return null;
+    },
+  });
+  setMode('blocks');
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,37 @@
+# Data — separately distributed via Hugging Face
+#   https://huggingface.co/datasets/CAMUS-LAB/seoul-travel-demand-2024
+data/raw/
+data/derived/
+data/viewer/*.fgb
+data/viewer/tiles/
+data/*.zip
+data/*.fgb
+data/*.parquet
+data/*.geojson
+
+# Distribution / packaging artifacts
+dist/
+
+# Lecture content (separate workflow, work-in-progress)
+lecture_note/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+.pytest_cache/
+.venv/
+venv/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Temporary
+*.log
+*.tmp
+*~
