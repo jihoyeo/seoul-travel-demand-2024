@@ -11,7 +11,9 @@ data/
 │  ├─ sgis_oa/            통계청 SGIS 집계구 경계 2025-2Q (인구센서스 단위, 권위)
 │  ├─ sgis_oa_2016/       통계청 SGIS 집계구 경계 2016년 기준 (서울 생활인구의 매핑 기반)
 │  ├─ sgis_census/        통계청 SGIS 집계구별 인구·가구·주택 통계 (2024)
-│  └─ seoul_living_pop/   서울 열린데이터 광장 집계구별 시간대별 생활인구 (내국인)
+│  ├─ seoul_living_pop/   서울 열린데이터 광장 집계구별 시간대별 생활인구 (내국인)
+│  ├─ seoul_living_movement/  서울 열린데이터 광장 행정동·자치구 단위 OD (생활이동, KT)
+│  └─ admdong_boundary/   행정동 경계 폴리곤 (전국 3,516)
 ├─ derived/    # 우리가 가공해 분석에 직접 쓰는 산출물
 └─ viewer/     # deck.gl 웹 뷰어용 슬림 사본 (WGS84)
 ```
@@ -222,6 +224,101 @@ LOCAL_PEOPLE.집계구코드(13) ───직접 join─→ raw/sgis_oa_2016/집
 **행정동 단위 매핑** — 2016 SGIS `ADM_CD`(7) → 2025 SGIS `ADM_CD`(8) 는 **단순 `× 10` (zero-pad)** 로 변환 가능. 419/426 직접 매칭. 7개 분동·통합 케이스만 별도 mapping table.
 
 **LOCAL_PEOPLE의 `행정동코드` 컬럼(8자리, 행안부)** 는 사실상 무시해도 됨 — `집계구코드(13)` 만으로 위 chain 으로 결합되기 때문. 행안부 ↔ SGIS 행정동 매핑이 별도로 필요한 분석이 있을 때만 명칭 매칭으로 따로 만들 것.
+
+### `raw/seoul_living_movement/` (생활이동 — KT 기반 관측 OD)
+
+서울 열린데이터 광장의 **KT 생활이동 데이터**. 휴대전화 시그널링으로 추정한 관측 OD. 두 가지 입도 보유:
+
+#### 1. `admdong_od_20240327.parquet` — 단일 일자, 행정동 ×목적 OD
+
+| 항목 | 값 |
+|---|---|
+| 출처 | 서울 열린데이터 광장 — 동별 목적OD (`data.seoul.go.kr/dataList/OA-21285`) |
+| 기준일 | 2024-03-27 (수요일) |
+| 입도 | 전국 행정동 × 행정동 (출/도착 시간대, 내·외국인, 목적별) |
+| 행 수 | 6,741,497 (서울 O×D 만 필터 시 2,202,055) |
+| 사이즈 | 102 MB parquet (snappy, 원본 CSV 380 MB cp949) |
+| 원본 보존 | 원본 CSV(`input_data.csv`) 는 보존하지 않음. 재다운로드 가능. |
+
+**컬럼**
+| 컬럼 | 타입 | 의미 |
+|---|---|---|
+| `ETL_YMD` | int32 | 수집일 `YYYYMMDD` (현재 `20240327` 단일) |
+| `O_ADMDONG_CD` | int32 | 출발 행정동 8자리 (행안부 체계). 서울 = `11`로 시작 |
+| `D_ADMDONG_CD` | int32 | 도착 행정동 8자리 |
+| `ST_TIME_CD` | int8 | 출발 시간대 `0`–`23` |
+| `FNS_TIME_CD` | int8 | 도착 시간대 `0`–`23` (`FNS_TIME_CD ≥ ST_TIME_CD`, day-crossing 미반영) |
+| `IN_FORN_DIV_NM` | int8 | 내·외국인 — `1` 내국인 (≈95%) · `2` 외국인 |
+| `MOVE_PURPOSE` | int8 | 통행 목적 `1`–`7` ❓ 공식 명세 미동봉 — 추정 [`1` 출근, `2` 등교, `3` 쇼핑/외식, `4` 여가, `5` 업무, `6` 기타, `7` 귀가]. **분포 확인 후 학생이 직접 라벨링하는 연습 대상** |
+| `MOVE_DIST` | float32 | 평균 이동 거리 (미터) |
+| `MOVE_TIME` | float32 | 평균 이동 시간 (초) |
+| `CNT` | float32 | 통행자 수 (실수 — KT 표본을 인구 비율로 보정한 추정값) |
+
+**핵심 주의 — 행정동 코드 체계**
+
+`O/D_ADMDONG_CD` 는 **행정안전부 8자리 코드** (예: 종로구 청운효자동 = `11110515`). 통계청 SGIS `ADM_CD`(8자리, 종로구 = `11010xxx`)와는 **시군구 segment 가 다른 별개 체계**. LOCAL_PEOPLE 의 `행정동코드` 와 동일 체계라 명칭 매칭이 필요한 join (admdong_od ↔ SGIS oa_master) 은:
+- (a) `data/raw/admdong_boundary/admdong_2023.geojson` 의 `adm_cd2`(행안부 10자리, 앞 8 = ADMDONG_CD) 와 `adm_cd`(SGIS 10자리) 가 같은 행에 들어 있어 **이 geojson 이 행안부 ↔ SGIS 변환표** 역할
+- (b) 또는 한글 명칭 (`adm_nm`) 매칭
+
+**MOVE_PURPOSE 코드 분포 (2024-03-27)**
+| 코드 | 행 수 |
+|---:|---:|
+| 1 | 1,247,370 |
+| 2 | 251,033 |
+| 3 | 2,398,140 |
+| 4 | 32,118 |
+| 5 | 4,835 |
+| 6 | 21,677 |
+| 7 | 2,786,324 |
+
+#### 2. `gu_hourly_od_202310.parquet` — 한 달, 자치구 × 시간대 × 성연령 × 이동유형 OD
+
+| 항목 | 값 |
+|---|---|
+| 출처 | 서울 열린데이터 광장 — 수도권 생활이동 (자치구 단위) |
+| 기준 | 2023-10 한 달 |
+| 입도 | 시군구 × 시군구 × 시간대 × 요일 × 성 × 연령 × 이동유형 |
+| 행 수 | 31,284,404 |
+| 사이즈 | 128 MB parquet |
+
+**컬럼**
+| 컬럼 | 타입 | 의미 |
+|---|---|---|
+| `ETL_YM` | int32 | `YYYYMM` (`202310`) |
+| `DAYOFWEEK` | category | 한글 (`월`, `화`, …, `일`) |
+| `ARR_TIME` | int8 | 도착 시간대 `0`–`23` |
+| `O_GU_CD`, `D_GU_CD` | int32 | 출/도착 **시군구 5자리** (행안부, 서울 `11010`–`11250` 25개). 종로구=`11010` |
+| `SEX` | category | `F` · `M` |
+| `AGE_GROUP` | Int8 (nullable) | 5세 단위 (0, 10, 15, 20, 25, …, 80). NaN = 표본 보호 |
+| `MOVE_TYPE` | category | 2-letter (`H`=Home, `W`=Work, `E`=Etc) 조합 9개 — `HH`, `HW`, `HE`, `WH`, `WW`, `WE`, `EH`, `EW`, `EE` |
+| `AVG_MOVE_TIME_MIN` | Int16 (nullable) | 평균 이동 시간 (분) |
+| `MOVE_POP` | float32 | 통행 인구 (4,025,240 행은 `*` 표본 보호 → NaN, ≈13%) |
+
+**원본 결측 처리** — `MOVE_POP`, `AVG_MOVE_TIME_MIN`, `AGE_GROUP` 에 표본 보호용 `*` 가 들어가 있어 nullable dtype 으로 보존. 0 imputation 금지.
+
+### `raw/admdong_boundary/admdong_2023.geojson`
+
+| 항목 | 값 |
+|---|---|
+| 출처 | 행정안전부 (KOSIS, 통계청 행정구역 변경 이력 통합) — 비둘기맘 GitHub 등 보조 채널로도 유통 |
+| 기준일 | 2023-01-01 |
+| 입도 | 전국 행정동 |
+| 행 수 | 3,516 (서울 426) |
+| CRS | EPSG:4326 |
+| 사이즈 | 34 MB |
+
+**컬럼** (str 컬럼은 leading zero 보존 — int 변환 시 주의)
+| 컬럼 | 길이 | 의미 |
+|---|---|---|
+| `adm_cd` | str(7) | SGIS 행정동 단축 코드. 종로구 청운효자동 = `1101053` |
+| `adm_cd8` | str(8) | `adm_cd + '0'` (SGIS 표준 8자리) |
+| `adm_cd2` | str(10) | **행안부 10자리 코드 — 앞 8자리 = `admdong_od.O/D_ADMDONG_CD` 매칭 키** (서울 426 100% 매칭) |
+| `adm_nm` | str | 한글 명칭 (`시도 시군구 행정동`, cp949 원본 → utf-8) |
+| `sgg`, `sggnm` | str | 시군구 코드/명 |
+| `sido`, `sidonm` | str | 시도 코드/명 |
+| `geometry` | geom | MultiPolygon, WGS84 |
+
+→ 이 파일이 **행안부(생활이동) ↔ SGIS(센서스) 행정동 코드 변환표**. `admdong_od` 의 `O/D_ADMDONG_CD` (int 8자리) 와 join 하려면 `adm_cd2.str[:8].astype(int)` 로 키 생성.
 
 ### `raw/roads/segment/TL_SPRD_MANAGE_11_202601.shp`
 

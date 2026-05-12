@@ -5,15 +5,13 @@ data/derived/
 data/viewer/*.fgb
 data/viewer/tiles/
 data/*.zip
+data/*.7z
 data/*.fgb
 data/*.parquet
 data/*.geojson
 
 # Distribution / packaging artifacts
 dist/
-
-# Lecture content (separate workflow, work-in-progress)
-lecture_note/
 
 # Python
 __pycache__/

@@ -9,13 +9,25 @@
 git clone https://github.com/jihoyeo/seoul-travel-demand-2024.git
 cd seoul-travel-demand-2024
 
-# 2) raw 데이터 받기 (Hugging Face, 1.4 GB 7z)
-pip install huggingface_hub
-huggingface-cli download CAMUS-LAB/seoul-travel-demand-2024 \
-    seoul_taz_raw.7z --repo-type dataset --local-dir .
-7z x seoul_taz_raw.7z      # → data/raw/ 생성
+# 2) 데이터 받기 (Hugging Face) — 용도에 맞는 것만 받으면 됨
+pip install -U huggingface_hub
 
-# 3) 파이프라인 (소요 ≈ 8분, 메모리 8GB+ 권장)
+# 2a) 뷰어만 띄울 거면 (~300 MB)
+hf download CAMUS-LAB/seoul-travel-demand-2024 \
+    seoul_taz_viewer.7z --repo-type dataset --local-dir .
+7z x seoul_taz_viewer.7z   # → data/viewer/{*.fgb, tiles/}
+
+# 2b) 분석·모델링용 산출물 (~550 MB) — 3) 파이프라인 안 돌리고 바로 쓰려면 이것만
+hf download CAMUS-LAB/seoul-travel-demand-2024 \
+    seoul_taz_derived.7z --repo-type dataset --local-dir .
+7z x seoul_taz_derived.7z  # → data/derived/
+
+# 2c) 원본 데이터 (1.4 GB) — 3) 파이프라인 재실행할 때만 필요
+hf download CAMUS-LAB/seoul-travel-demand-2024 \
+    seoul_taz_raw.7z --repo-type dataset --local-dir .
+7z x seoul_taz_raw.7z      # → data/raw/
+
+# 3) (선택) 파이프라인 재실행 — 2c) raw 가 있어야 함. 소요 ≈ 8분, 메모리 8GB+ 권장
 python blocks/oa2016_to_oa2025.py
 python blocks/build_oa_master.py        # ~6분 (LP 31일 스트리밍)
 python blocks/build_blocks_oa.py        # ~60s (parcels overlay)
@@ -23,9 +35,11 @@ python blocks/aggregate_landuse.py      # ~30s
 ```
 
 데이터 분리:
-- **코드 (본 repo)** : `blocks/`, `seoul_zoning_viz/`, `seoul_taz_viz/`, `data/README.md`, `data/viewer/index.html`
-- **raw 데이터** : Hugging Face `CAMUS-LAB/seoul-travel-demand-2024` (1.4 GB 7z)
-- **derived 산출물** : 위 스크립트로 재생성 (`.gitignore` 처리)
+- **코드 (본 repo)** : `blocks/`, `seoul_zoning_viz/`, `seoul_taz_viz/`, `data/README.md`, `data/viewer/{index.html, manifest.json}`
+- **데이터** : Hugging Face `CAMUS-LAB/seoul-travel-demand-2024`
+  - `seoul_taz_viewer.7z` — deck.gl 뷰어용 fgb + tiles
+  - `seoul_taz_derived.7z` — 파이프라인 산출물 (`oa_master.parquet`, `seoul_blocks.fgb` 등)
+  - `seoul_taz_raw.7z` — 외부 원본 (LSMD / SGIS / 도로 / 생활인구), 파이프라인 재실행 시에만 필요
 
 ## Layout
 

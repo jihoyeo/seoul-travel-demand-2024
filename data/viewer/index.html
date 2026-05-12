@@ -263,38 +263,46 @@ const BlocksMode = (() => {
     return layers;
   }
 
-  async function loadKind(kind, rect, mygen) {
-    if (inflight[kind]) inflight[kind].cancelled = true;
-    const tok = { cancelled: false };
-    inflight[kind] = tok;
-    let added = 0;
-    try {
-      for await (const f of fgb.deserialize(URLS[kind], rect)) {
-        if (tok.cancelled || mygen !== gen || activeMode !== 'blocks') return;
-        const id = f.properties[ID_KEY[kind]];
-        if (id == null) continue;
-        if (!stores[kind].has(id)) {
-          stores[kind].set(id, f);
-          added++;
-          if (added % 4000 === 0) requestRender();
+  // 스트리밍 로드 — flatgeobuf JS bbox 버그 회피, 한 번만 전체 다운로드 + 메모리 캐시
+  const loadedKinds = new Set();
+  const inflightKinds = new Map();
+  async function loadKind(kind) {
+    if (loadedKinds.has(kind)) return;
+    if (inflightKinds.has(kind)) return inflightKinds.get(kind);
+    const p = (async () => {
+      let added = 0;
+      try {
+        const resp = await fetch(URLS[kind]);
+        if (!resp.ok) throw new Error(`fetch ${URLS[kind]}: ${resp.status}`);
+        for await (const f of fgb.deserialize(resp.body)) {
+          if (activeMode !== 'blocks') return;
+          const id = f.properties[ID_KEY[kind]];
+          if (id == null) continue;
+          if (!stores[kind].has(id)) {
+            stores[kind].set(id, f);
+            added++;
+            if (added % 4000 === 0) requestRender();
+          }
         }
-      }
-    } catch(e) { console.warn('[blocks]', kind, e); }
-    if (!tok.cancelled) requestRender();
+        loadedKinds.add(kind);
+      } catch(e) { console.warn('[blocks]', kind, e); }
+      requestRender();
+    })();
+    inflightKinds.set(kind, p);
+    p.finally(() => inflightKinds.delete(kind));
+    return p;
   }
 
   function reload() {
-    const mygen = ++gen;
-    const rect = currentBbox();
     const z = viewState.zoom;
     const tasks = [];
-    tasks.push(loadKind('blocks', rect, mygen));
-    tasks.push(loadKind('arterial', rect, mygen));
-    if (layerOn['oa-excl']) tasks.push(loadKind('oa_excl', rect, mygen));
-    if (z >= (manifest?.lod_aux_min_zoom ?? 13)) tasks.push(loadKind('aux', rect, mygen));
-    setStatus(`<span class="spinner"></span> blocks z=${z.toFixed(1)}`);
+    tasks.push(loadKind('blocks'));
+    tasks.push(loadKind('arterial'));
+    if (layerOn['oa-excl']) tasks.push(loadKind('oa_excl'));
+    if (z >= (manifest?.lod_aux_min_zoom ?? 13)) tasks.push(loadKind('aux'));
+    setStatus(`<span class="spinner"></span> blocks z=${z.toFixed(1)} · streaming`);
     Promise.allSettled(tasks).then(() => {
-      if (mygen === gen) setStatus(`blocks ready · z=${z.toFixed(1)}`);
+      setStatus(`blocks ready · z=${z.toFixed(1)}`);
     });
   }
 
@@ -670,60 +678,74 @@ const PointsMode = (() => {
     loading = true;
     setStatus('<span class="spinner"></span> points 다운로드…');
 
-    // 사이즈 미리 받기 (progress 표시용)
-    let total = 0;
-    try {
-      const head = await fetch(FGB_URL, { method: 'HEAD' });
-      total = +head.headers.get('content-length') || 0;
-    } catch (e) {}
-
-    // 1차 패스로 행 수 추정 — fgb header에는 features count 가 있어 deserialize iterator 시작 후 알 수 있음.
-    // 메모리 절약 위해 동적 typed array 확장.
-    let cap = 1_000_000;
-    positions = new Float32Array(cap * 2);
-    radii = new Float32Array(cap);
-    zoneIdx = new Uint8Array(cap);
-    kindIdx = new Uint8Array(cap);
-    pnus = new Array(cap);
-    areas = new Int32Array(cap);
-
-    // flatgeobuf 3.36+에서 deserialize(url, rect) 필수. 전체 로드를 위해 서울 bbox.
-    const SEOUL_BBOX = { minX: 126.6, minY: 37.3, maxX: 127.3, maxY: 37.8 };
-    let i = 0, lastReport = 0;
+    // 다운로드 진행률 표시를 위해 reader로 청크 누적 → 단일 ArrayBuffer 구성.
+    // 그 다음 fgb.deserialize(Uint8Array) 동기 버퍼 모드로 파싱.
+    // 스트리밍(deserialize(resp.body))은 196MB+rtree 36MB 환경에서 청크 경계가 어긋나
+    //   파서 내부 geometry()가 null로 읽혀 xyArray 크래시가 나는 케이스가 있어 회피.
     const t0 = performance.now();
+    let buf;
     try {
-      for await (const f of fgb.deserialize(FGB_URL, SEOUL_BBOX)) {
-        if (i >= cap) {
-          cap *= 2;
-          const np = new Float32Array(cap * 2); np.set(positions); positions = np;
-          const nr = new Float32Array(cap); nr.set(radii); radii = nr;
-          const nz = new Uint8Array(cap); nz.set(zoneIdx); zoneIdx = nz;
-          const nk = new Uint8Array(cap); nk.set(kindIdx); kindIdx = nk;
-          pnus.length = cap;
-          const na = new Int32Array(cap); na.set(areas); areas = na;
-        }
-        const c = f.geometry.coordinates;
-        positions[i*2] = c[0];
-        positions[i*2+1] = c[1];
-        const a = f.properties.area_m2 || 0;
-        areas[i] = a;
-        radii[i] = Math.sqrt(Math.max(a, 1)) * 0.5;
-        zoneIdx[i] = ZONE_INDEX_OF[f.properties.zone_class] ?? 255;
-        const ki = KIND_INDEX.indexOf(f.properties.jimok_kind);
-        kindIdx[i] = ki < 0 ? KIND_INDEX.indexOf('미지정') : ki;
-        pnus[i] = f.properties.pnu;
-        i++;
-        if (i - lastReport >= 80000) {
-          lastReport = i;
-          setStatus(`<span class="spinner"></span> points 로드 ${fmt(i)}…`);
-          requestRender();
+      const resp = await fetch(FGB_URL);
+      if (!resp.ok) throw new Error(`fetch ${FGB_URL}: ${resp.status}`);
+      const total = +resp.headers.get('content-length') || 0;
+      const reader = resp.body.getReader();
+      const chunks = [];
+      let received = 0, lastReport = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.byteLength;
+        if (received - lastReport >= 4_000_000) {
+          lastReport = received;
+          const pct = total ? ` ${(100*received/total).toFixed(0)}%` : '';
+          setStatus(`<span class="spinner"></span> points 다운로드${pct} · ${(received/1048576).toFixed(0)}MB`);
         }
       }
+      buf = new Uint8Array(received);
+      let o = 0;
+      for (const c of chunks) { buf.set(c, o); o += c.byteLength; }
     } catch (e) {
-      setStatus('points error: ' + e.message);
+      setStatus('points fetch error: ' + e.message);
       console.error(e);
       loading = false;
       return;
+    }
+
+    setStatus(`<span class="spinner"></span> points 파싱 ${fmt(buf.byteLength)} bytes…`);
+    await new Promise(r => setTimeout(r, 0));   // 상태 업데이트 한 프레임 flush
+
+    let fc;
+    try {
+      fc = fgb.deserialize(buf);   // 동기 — FeatureCollection 반환
+    } catch (e) {
+      setStatus('points parse error: ' + e.message);
+      console.error(e);
+      loading = false;
+      return;
+    }
+    const feats = fc.features;
+    const n = feats.length;
+    positions = new Float32Array(n * 2);
+    radii    = new Float32Array(n);
+    zoneIdx  = new Uint8Array(n);
+    kindIdx  = new Uint8Array(n);
+    pnus     = new Array(n);
+    areas    = new Int32Array(n);
+    let i = 0;
+    for (const f of feats) {
+      const c = f.geometry && f.geometry.coordinates;
+      if (!c) continue;
+      positions[i*2]   = c[0];
+      positions[i*2+1] = c[1];
+      const a = f.properties.area_m2 || 0;
+      areas[i] = a;
+      radii[i] = Math.sqrt(Math.max(a, 1)) * 0.5;
+      zoneIdx[i] = ZONE_INDEX_OF[f.properties.zone_class] ?? 255;
+      const ki = KIND_INDEX.indexOf(f.properties.jimok_kind);
+      kindIdx[i] = ki < 0 ? KIND_INDEX.indexOf('미지정') : ki;
+      pnus[i] = f.properties.pnu;
+      i++;
     }
     count = i;
     // trim arrays
@@ -1003,42 +1025,65 @@ const StatsMode = (() => {
     if (timer) clearTimeout(timer);
     timer = setTimeout(doFetch, 250);
   }
-  async function loadFgb(url, store, idKey, my) {
-    let added = 0;
-    try {
-      for await (const f of fgb.deserialize(url, currentBbox())) {
-        if (my !== token || activeMode !== 'stats') return;
-        const k = f.properties[idKey];
-        if (k != null && !store.has(k)) {
-          store.set(k, f);
-          added++;
-          if (added % 200 === 0) requestRender();
+  // 스트리밍 로드 — flatgeobuf JS bbox 버그 회피, URL별 한 번만 다운로드
+  const loadedStatsUrls = new Set();
+  const inflightStatsUrls = new Map();
+  async function loadFgb(url, store, idKey) {
+    if (loadedStatsUrls.has(url)) return;
+    if (inflightStatsUrls.has(url)) return inflightStatsUrls.get(url);
+    const p = (async () => {
+      let added = 0;
+      try {
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error(`fetch ${url}: ${resp.status}`);
+        for await (const f of fgb.deserialize(resp.body)) {
+          if (activeMode !== 'stats') return;
+          const k = f.properties[idKey];
+          if (k != null && !store.has(k)) {
+            store.set(k, f);
+            added++;
+            if (added % 200 === 0) requestRender();
+          }
         }
-      }
-    } catch (e) { console.warn('[stats]', url, e); }
+        loadedStatsUrls.add(url);
+      } catch (e) { console.warn('[stats]', url, e); }
+    })();
+    inflightStatsUrls.set(url, p);
+    p.finally(() => inflightStatsUrls.delete(url));
+    return p;
   }
   async function doFetch() {
     if (activeMode !== 'stats') return;
     const my = ++token;
-    setStatus(`<span class="spinner"></span> stats z=${viewState.zoom.toFixed(1)}`);
-    let added = 0;
+    setStatus(`<span class="spinner"></span> stats z=${viewState.zoom.toFixed(1)} · streaming`);
     const tasks = [];
-    // OA fill (필수)
+    // OA fill (필수) — 같은 streaming 패턴
     tasks.push((async () => {
-      try {
-        for await (const f of fgb.deserialize(FGB_URL, currentBbox())) {
-          if (my !== token || activeMode !== 'stats') return;
-          const k = f.properties.oa_cd;
-          if (!cache.has(k)) {
-            cache.set(k, f);
-            added++;
-            if (added % 2000 === 0) { recomputeBreaks(); requestRender(); }
+      if (loadedStatsUrls.has(FGB_URL)) return;
+      if (inflightStatsUrls.has(FGB_URL)) return inflightStatsUrls.get(FGB_URL);
+      const p = (async () => {
+        let added = 0;
+        try {
+          const resp = await fetch(FGB_URL);
+          if (!resp.ok) throw new Error(`fetch ${FGB_URL}: ${resp.status}`);
+          for await (const f of fgb.deserialize(resp.body)) {
+            if (activeMode !== 'stats') return;
+            const k = f.properties.oa_cd;
+            if (!cache.has(k)) {
+              cache.set(k, f);
+              added++;
+              if (added % 2000 === 0) { recomputeBreaks(); requestRender(); }
+            }
           }
-        }
-      } catch (e) { console.warn('[stats] oa', e); }
+          loadedStatsUrls.add(FGB_URL);
+        } catch (e) { console.warn('[stats] oa', e); }
+      })();
+      inflightStatsUrls.set(FGB_URL, p);
+      p.finally(() => inflightStatsUrls.delete(FGB_URL));
+      return p;
     })());
-    if (layerOn['adm-line']) tasks.push(loadFgb(ADM_URL, admStore, 'adm_cd', my));
-    if (layerOn['blk-line']) tasks.push(loadFgb(BLK_URL, blkStore, 'block_id', my));
+    if (layerOn['adm-line']) tasks.push(loadFgb(ADM_URL, admStore, 'adm_cd'));
+    if (layerOn['blk-line']) tasks.push(loadFgb(BLK_URL, blkStore, 'block_id'));
     try {
       await Promise.allSettled(tasks);
       if (my !== token) return;
@@ -1275,35 +1320,45 @@ const RoadMode = (() => {
     return layers;
   }
 
-  async function loadFgb(url, store, key, mygen) {
-    if (inflight[key]) inflight[key].cancelled = true;
-    const tok = { cancelled: false };
-    inflight[key] = tok;
-    let added = 0;
-    try {
-      for await (const f of fgb.deserialize(url, currentBbox())) {
-        if (tok.cancelled || mygen !== gen || activeMode !== 'road') return;
-        const id = f.properties[key === 'roads' ? 'link_id' : 'block_id'];
-        if (id == null) continue;
-        if (!store.has(id)) {
-          store.set(id, f);
-          added++;
-          if (added % 4000 === 0) { renderStats(); requestRender(); }
+  // 스트리밍 로드: flatgeobuf JS bbox 쿼리가 깊은 rtree(>~2k features)에서 버그가 있어
+  // 전체 파일을 한 번 다운로드 후 클라이언트 메모리에 캐시. 같은 URL은 두 번 stream 안 함.
+  const loadedUrls = new Set();
+  const inflightUrls = new Map();
+  async function loadFgb(url, store, key) {
+    if (loadedUrls.has(url)) return;
+    if (inflightUrls.has(url)) return inflightUrls.get(url);
+    const p = (async () => {
+      let added = 0;
+      try {
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error(`fetch ${url}: ${resp.status}`);
+        for await (const f of fgb.deserialize(resp.body)) {
+          if (activeMode !== 'road') return;
+          const id = f.properties[key === 'roads' ? 'link_id' : 'block_id'];
+          if (id == null) continue;
+          if (!store.has(id)) {
+            store.set(id, f);
+            added++;
+            if (added % 4000 === 0) { renderStats(); requestRender(); }
+          }
         }
-      }
-    } catch (e) { console.warn('[road]', url, e); }
-    if (!tok.cancelled) { renderStats(); requestRender(); }
+        loadedUrls.add(url);
+      } catch (e) { console.warn('[road]', url, e); }
+      renderStats(); requestRender();
+    })();
+    inflightUrls.set(url, p);
+    p.finally(() => inflightUrls.delete(url));
+    return p;
   }
 
   function reload() {
-    const mygen = ++gen;
     const z = viewState.zoom;
     const tasks = [];
-    if (layerOn['blocks-bg']) tasks.push(loadFgb(URL_BLK, stores.blocks, 'blocks', mygen));
-    if (layerOn['roads'])     tasks.push(loadFgb(URL_ROAD, stores.roads, 'roads', mygen));
-    setStatus(`<span class="spinner"></span> road z=${z.toFixed(1)}  thr=${minLane ?? laneThreshold(z)}+ 차선`);
+    if (layerOn['blocks-bg']) tasks.push(loadFgb(URL_BLK, stores.blocks, 'blocks'));
+    if (layerOn['roads'])     tasks.push(loadFgb(URL_ROAD, stores.roads, 'roads'));
+    setStatus(`<span class="spinner"></span> road z=${z.toFixed(1)}  thr=${minLane ?? laneThreshold(z)}+ 차선 · streaming 96MB roads (첫 로드만)`);
     Promise.allSettled(tasks).then(() => {
-      if (mygen === gen) setStatus(`road ready · z=${z.toFixed(1)} · cache ${fmt(stores.roads.size)}`);
+      setStatus(`road ready · z=${z.toFixed(1)} · cache ${fmt(stores.roads.size)}`);
     });
   }
 
